@@ -1,0 +1,6 @@
+modelo,exactitud,exactitud_balanceada,sensibilidad,precision,f1,especificidad,roc_auc,pr_auc,exactitud_std,exactitud_balanceada_std,sensibilidad_std,precision_std,f1_std,especificidad_std,roc_auc_std,pr_auc_std
+N0 · Siempre la clase mayoritaria,0.5209,0.5,0.0,0.0,0.0,1.0,0.5,0.4791,0.0066,0.0,0.0,0.0,0.0,0.0,0.0,0.0066
+N0 · Aleatorio estratificado,0.5524,0.5493,0.4787,0.5371,0.5062,0.62,0.5493,0.5103,0.0551,0.0547,0.0544,0.0615,0.0577,0.0557,0.0547,0.03
+N1 · Heurística 1 variable (thal),0.7424,0.7427,0.7453,0.7262,0.7334,0.74,0.7615,0.6932,0.0358,0.0368,0.0776,0.0319,0.0439,0.049,0.0453,0.049
+N1b · Heurística clínica (4 señales),0.8204,0.8179,0.7608,0.8554,0.7995,0.875,0.865,0.8428,0.0485,0.0496,0.1069,0.0631,0.063,0.0716,0.0388,0.0379
+N2 · Regla aprendida (stump),0.7502,0.7478,0.6906,0.7655,0.7226,0.805,0.7478,0.6787,0.0486,0.05,0.1018,0.0443,0.0679,0.0472,0.05,0.049
