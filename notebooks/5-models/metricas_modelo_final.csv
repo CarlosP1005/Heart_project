@@ -1,0 +1,4 @@
+modelo,exactitud,exactitud balanceada,sensibilidad,precisión,F1,ROC AUC,PR AUC
+Gradient Boosting (regularizado),0.875,0.8765,0.913,0.84,0.875,0.9435,0.9283
+Modelo base (4 reglas),0.8229,0.8204,0.7609,0.8537,0.8046,0.883,0.8538
+mejora,0.0521,0.0561,0.1522,-0.0137,0.0704,0.0604,0.0745
