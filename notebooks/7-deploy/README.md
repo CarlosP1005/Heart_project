@@ -93,6 +93,7 @@ Comprueba con qué versión se entrenó el `.joblib` que vas a desplegar:
 
 ```python
 import joblib
+
 print(joblib.load("modelo_corazon_interpretado_completo.joblib")["version_sklearn"])
 ```
 
