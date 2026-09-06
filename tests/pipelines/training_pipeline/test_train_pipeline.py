@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
@@ -35,6 +36,11 @@ from pipelines.training_pipeline.train_pipeline import (
     separar_train_test,
     validar_cruzado,
 )
+
+#: (X_train, X_test, y_train, y_test). El hook de mypy corre en un entorno aislado
+#: sin pandas, así que ve `DataFrame` como `Any`; el alias lo deja explícito y evita
+#: el aviso `no-any-return` al devolver la tupla.
+Conjuntos = tuple[Any, Any, Any, Any]
 
 #: Valores esperados en las aserciones (evita "magic values" en el linter).
 N_FILAS_SINTETICAS = 200
@@ -100,21 +106,22 @@ def tabla_features() -> pd.DataFrame:
 @pytest.fixture(scope="module")
 def ruta_features(tmp_path_factory: pytest.TempPathFactory, tabla_features: pd.DataFrame) -> Path:
     """Parquet de features en disco, tal como lo deja el paso anterior."""
-    ruta = tmp_path_factory.mktemp("datos") / "corazon_features.parquet"
+    ruta: Path = tmp_path_factory.mktemp("datos") / "corazon_features.parquet"
     tabla_features.to_parquet(ruta, index=False)
     return ruta
 
 
 @pytest.fixture
-def conjuntos(tabla_features: pd.DataFrame) -> tuple:
+def conjuntos(tabla_features: pd.DataFrame) -> Conjuntos:
     """Separación train/test lista para usar en las pruebas."""
     atributos = tabla_features.drop(columns=["disease"])
     objetivo = tabla_features["disease"]
-    return separar_train_test(atributos, objetivo)
+    resultado: Conjuntos = separar_train_test(atributos, objetivo)
+    return resultado
 
 
 @pytest.fixture
-def modelo_entrenado(conjuntos: tuple) -> Pipeline:
+def modelo_entrenado(conjuntos: Conjuntos) -> Pipeline:
     """Pipeline entrenado sobre los datos sintéticos."""
     x_train, _, y_train, _ = conjuntos
     return entrenar(construir_pipeline(), x_train, y_train)
@@ -229,7 +236,7 @@ def test_construir_pipeline_rechaza_modelo_desconocido() -> None:
         construir_pipeline("perceptron_magico")
 
 
-def test_entrenar_deja_el_pipeline_ajustado(conjuntos: tuple) -> None:
+def test_entrenar_deja_el_pipeline_ajustado(conjuntos: Conjuntos) -> None:
     """Tras entrenar, el pipeline predice y expone las clases aprendidas."""
     x_train, x_test, y_train, _ = conjuntos
     pipeline = entrenar(construir_pipeline(), x_train, y_train)
@@ -238,7 +245,7 @@ def test_entrenar_deja_el_pipeline_ajustado(conjuntos: tuple) -> None:
     assert set(np.unique(predicciones)) <= {0, 1}
 
 
-def test_entrenar_maneja_los_faltantes(conjuntos: tuple) -> None:
+def test_entrenar_maneja_los_faltantes(conjuntos: Conjuntos) -> None:
     """El imputador absorbe los NaN que el feature pipeline dejó a propósito."""
     x_train, x_test, y_train, _ = conjuntos
     pipeline = entrenar(construir_pipeline(), x_train, y_train)
@@ -246,7 +253,7 @@ def test_entrenar_maneja_los_faltantes(conjuntos: tuple) -> None:
     assert not np.isnan(probabilidades).any()
 
 
-def test_entrenamiento_es_reproducible(conjuntos: tuple) -> None:
+def test_entrenamiento_es_reproducible(conjuntos: Conjuntos) -> None:
     """Dos entrenamientos con la misma semilla dan las mismas probabilidades."""
     x_train, x_test, y_train, _ = conjuntos
     primera = entrenar(construir_pipeline(), x_train, y_train).predict_proba(x_test)
@@ -259,7 +266,9 @@ def test_entrenamiento_es_reproducible(conjuntos: tuple) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_evaluar_devuelve_todas_las_metricas(modelo_entrenado: Pipeline, conjuntos: tuple) -> None:
+def test_evaluar_devuelve_todas_las_metricas(
+    modelo_entrenado: Pipeline, conjuntos: Conjuntos
+) -> None:
     """La evaluación cubre las siete métricas, todas en [0, 1]."""
     _, x_test, _, y_test = conjuntos
     metricas = evaluar(modelo_entrenado, x_test, y_test)
@@ -267,7 +276,7 @@ def test_evaluar_devuelve_todas_las_metricas(modelo_entrenado: Pipeline, conjunt
     assert all(0.0 <= valor <= 1.0 for valor in metricas.values())
 
 
-def test_modelo_supera_a_la_base_trivial(modelo_entrenado: Pipeline, conjuntos: tuple) -> None:
+def test_modelo_supera_a_la_base_trivial(modelo_entrenado: Pipeline, conjuntos: Conjuntos) -> None:
     """Con señal en los datos, el modelo debe batir a predecir la clase mayoritaria."""
     x_train, x_test, y_train, y_test = conjuntos
     metricas = evaluar(modelo_entrenado, x_test, y_test)
@@ -276,7 +285,7 @@ def test_modelo_supera_a_la_base_trivial(modelo_entrenado: Pipeline, conjuntos: 
     assert metricas["f1"] > MIN_F1_ACEPTABLE
 
 
-def test_evaluar_respeta_el_umbral(modelo_entrenado: Pipeline, conjuntos: tuple) -> None:
+def test_evaluar_respeta_el_umbral(modelo_entrenado: Pipeline, conjuntos: Conjuntos) -> None:
     """Bajar el umbral no puede reducir la sensibilidad."""
     _, x_test, _, y_test = conjuntos
     por_defecto = evaluar(modelo_entrenado, x_test, y_test, umbral=UMBRAL_DEFECTO)
@@ -284,14 +293,14 @@ def test_evaluar_respeta_el_umbral(modelo_entrenado: Pipeline, conjuntos: tuple)
     assert permisivo["sensibilidad"] >= por_defecto["sensibilidad"]
 
 
-def test_matriz_confusion_suma_el_total(modelo_entrenado: Pipeline, conjuntos: tuple) -> None:
+def test_matriz_confusion_suma_el_total(modelo_entrenado: Pipeline, conjuntos: Conjuntos) -> None:
     """Las cuatro celdas cubren exactamente el conjunto evaluado."""
     _, x_test, _, y_test = conjuntos
     matriz = matriz_confusion(modelo_entrenado, x_test, y_test)
     assert sum(matriz.values()) == len(y_test)
 
 
-def test_validacion_cruzada_devuelve_media_y_desviacion(conjuntos: tuple) -> None:
+def test_validacion_cruzada_devuelve_media_y_desviacion(conjuntos: Conjuntos) -> None:
     """La validación cruzada reporta F1 medio y su dispersión."""
     x_train, _, y_train, _ = conjuntos
     resultado = validar_cruzado(construir_pipeline(), x_train, y_train, n_particiones=3)
@@ -299,7 +308,7 @@ def test_validacion_cruzada_devuelve_media_y_desviacion(conjuntos: tuple) -> Non
     assert resultado["f1_std"] >= 0.0
 
 
-def test_optimizar_umbral_devuelve_un_valor_valido(conjuntos: tuple) -> None:
+def test_optimizar_umbral_devuelve_un_valor_valido(conjuntos: Conjuntos) -> None:
     """El umbral óptimo es una probabilidad dentro del rango barrido."""
     x_train, _, y_train, _ = conjuntos
     umbral = optimizar_umbral(construir_pipeline(), x_train, y_train, n_particiones=3)
@@ -328,7 +337,7 @@ def test_tabla_metricas_compara_los_cinco_escenarios() -> None:
 
 
 def test_guardar_modelo_se_puede_recargar(
-    tmp_path: Path, modelo_entrenado: Pipeline, conjuntos: tuple
+    tmp_path: Path, modelo_entrenado: Pipeline, conjuntos: Conjuntos
 ) -> None:
     """El modelo recargado reproduce exactamente las mismas predicciones."""
     _, x_test, _, _ = conjuntos
@@ -365,7 +374,7 @@ def test_guardar_metricas_escribe_csv_legible(tmp_path: Path) -> None:
 
 
 def test_guardar_predicciones_incluye_ambos_umbrales(
-    tmp_path: Path, modelo_entrenado: Pipeline, conjuntos: tuple
+    tmp_path: Path, modelo_entrenado: Pipeline, conjuntos: Conjuntos
 ) -> None:
     """El CSV de predicciones permite auditar caso por caso."""
     _, x_test, _, y_test = conjuntos
