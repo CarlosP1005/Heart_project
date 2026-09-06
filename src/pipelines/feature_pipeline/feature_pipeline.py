@@ -18,6 +18,23 @@ recorte de atípicos, escalado, discretización y selección de atributos— per
 dentro del pipeline de entrenamiento de scikit-learn para evitar fuga de información
 (*data leakage*) entre train y test. Por eso la tabla de features conserva los
 valores faltantes tal cual.
+
+Validación de datos
+-------------------
+El pipeline valida en tres puntos y **no persiste nada si alguna validación falla**:
+
+1. `validar_entrada`     — esquema del archivo crudo (columnas y contenido mínimo).
+2. `validar_intermedio`  — tipos, rangos, categorías válidas, porcentaje máximo de
+   nulos, formato de fechas y unicidad de registros sobre el dataset saneado.
+3. `validar_features`    — tipos, ausencia de infinitos, integridad entre campos
+   (atributos derivados y codificación one-hot) e integridad entre datasets
+   (intermedio vs. features).
+
+Las reglas de columna se declaran con **Pandera** (`pandera.pandas.DataFrameSchema`);
+las reglas que cruzan campos, registros o datasets se implementan como funciones
+explícitas para poder emitir un mensaje de error preciso. Cualquier incumplimiento
+lanza `ErrorDeValidacion`, el script registra el detalle y termina con código 1 sin
+haber escrito ningún archivo.
 """
 
 from __future__ import annotations
@@ -32,6 +49,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pandera.pandas as pa
+from pandera.errors import SchemaError, SchemaErrors
 
 # --------------------------------------------------------------------------- #
 # Configuración del dominio
@@ -67,6 +86,52 @@ COLS_NOMINALES: list[str] = ["chest_pain", "rest_ecg", "thal"]
 
 #: Columnas numéricas que pasan sin transformar a la tabla de features.
 COLS_PASO_DIRECTO: list[str] = ["age", "rest_bp", "chol", "max_hr", "old_peak", "ca", "fbs"]
+
+#: Atributos derivados del conocimiento clínico, en el orden en que se generan.
+NOMBRES_DERIVADOS: list[str] = [
+    "fc_maxima_teorica",
+    "reserva_cardiaca",
+    "pct_fc_alcanzada",
+    "ratio_chol_edad",
+    "presion_x_chol",
+    "indice_riesgo_st",
+]
+
+# --------------------------------------------------------------------------- #
+# Configuración de las validaciones
+# --------------------------------------------------------------------------- #
+
+#: Rango admitido por columna numérica, según plausibilidad clínica.
+#: Un valor fuera de rango no es un error de tipo sino un dato imposible
+#: (una presión de 900 mm Hg, una edad de 300 años) y debe detener el pipeline.
+RANGOS_VALIDOS: dict[str, tuple[float, float]] = {
+    "age": (18.0, 120.0),  # años
+    "rest_bp": (60.0, 260.0),  # mm Hg en reposo
+    "chol": (80.0, 700.0),  # mg/dl
+    "max_hr": (50.0, 220.0),  # lpm; 220 es el máximo teórico absoluto
+    "old_peak": (0.0, 10.0),  # depresión del ST en mm
+    "ca": (0.0, 3.0),  # nº de vasos coloreados por fluoroscopia
+    "fbs": (0.0, 1.0),  # indicador binario
+}
+
+#: Proporción máxima de nulos tolerada por columna tras el saneamiento.
+#: El dataset real llega al 24 % en `rest_ecg`; por encima de 35 % la columna deja
+#: de ser informativa y es preferible detener el pipeline a entrenar con ruido.
+MAX_PROPORCION_NULOS = 0.35
+
+#: Columnas de fecha y su formato esperado. Este dataset clínico no contiene
+#: ninguna, pero la regla queda implementada y parametrizada: basta añadir aquí
+#: una entrada (p. ej. {"fecha_examen": "%Y-%m-%d"}) para que se valide.
+COLS_FECHA: dict[str, str] = {}
+
+#: Campos clave cuya combinación debe ser única. El dataset no trae identificador
+#: de paciente, así que la unicidad se comprueba sobre el registro completo: tras
+#: la deduplicación no puede quedar ninguna fila repetida.
+CLAVE_UNICIDAD: list[str] = []
+
+#: Tolerancia al comparar atributos derivados recalculados (aritmética de punto
+#: flotante).
+TOLERANCIA = 1e-9
 
 # --------------------------------------------------------------------------- #
 # Rutas por defecto (relativas a la raíz del proyecto)
@@ -149,7 +214,10 @@ def sanear_dataset(datos: pd.DataFrame) -> pd.DataFrame:
     saneado = datos.copy()
 
     for col in COLS_NUMERICAS:
-        saneado[col] = pd.to_numeric(saneado[col], errors="coerce")
+        # `astype(float)` fija el tipo pase lo que pase: sin él, un lote sin
+        # faltantes daría int64 y otro con faltantes float64, y el esquema de
+        # validación fallaría por una diferencia que no es un problema de datos.
+        saneado[col] = pd.to_numeric(saneado[col], errors="coerce").astype("float64")
 
     for col, validas in CATEGORIAS_VALIDAS.items():
         serie = saneado[col].astype("string").str.strip().str.lower()
@@ -271,7 +339,316 @@ def construir_features(crudo: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
 
 
 # --------------------------------------------------------------------------- #
-# 4. Escritura
+# 4. Validación de datos
+# --------------------------------------------------------------------------- #
+
+
+class ErrorDeValidacion(RuntimeError):
+    """Una regla de calidad o integridad no se cumple.
+
+    Se lanza siempre **antes** de escribir ningún archivo, de modo que un dataset
+    que no supera las validaciones nunca llega a persistirse.
+    """
+
+
+def es_finito(serie: pd.Series) -> pd.Series:
+    """Comprueba elemento a elemento que no haya infinitos.
+
+    Pandera descarta los nulos antes de aplicar el check (`ignore_na`), así que
+    aquí sólo llegan valores presentes: un `inf` sólo puede venir de una división
+    por cero mal controlada.
+    """
+    return pd.Series(np.isfinite(serie.to_numpy(dtype="float64")), index=serie.index)
+
+
+def esquema_crudo() -> pa.DataFrameSchema:
+    """Esquema del archivo crudo: presencia de columnas y contenido mínimo.
+
+    En esta etapa todo es texto (aún no se han convertido los tipos), así que sólo
+    se comprueba que estén todas las columnas esperadas y que el archivo no venga
+    vacío. `strict=False` permite columnas extra sin romper el pipeline.
+    """
+    columnas = {
+        nombre: pa.Column(str, nullable=True, coerce=True)
+        for nombre in [*COLS_NUMERICAS, *CATEGORIAS_VALIDAS]
+    }
+    return pa.DataFrameSchema(
+        columns=columnas,
+        strict=False,
+        name="datos_crudos",
+        checks=pa.Check(
+            lambda df: len(df) > 0,
+            error="el archivo de entrada no contiene ninguna fila",
+        ),
+    )
+
+
+def esquema_intermedio() -> pa.DataFrameSchema:
+    """Esquema del dataset saneado: tipos, rangos, categorías y nulos.
+
+    - Las columnas numéricas deben ser `float` y caer dentro del rango clínico.
+    - Las categóricas sólo admiten valores del catálogo del dominio.
+    - La variable objetivo debe ser entera, binaria y **sin faltantes**: una fila
+      sin etiqueta no sirve para entrenar y ya debió eliminarse en la depuración.
+    """
+    columnas: dict[str, pa.Column] = {}
+
+    for nombre, (minimo, maximo) in RANGOS_VALIDOS.items():
+        columnas[nombre] = pa.Column(
+            float,
+            checks=pa.Check.in_range(minimo, maximo, include_min=True, include_max=True),
+            nullable=True,
+            description=f"numérica en [{minimo}, {maximo}]",
+        )
+
+    for nombre, validas in CATEGORIAS_VALIDAS.items():
+        if nombre == OBJETIVO:
+            continue
+        columnas[nombre] = pa.Column(
+            None,
+            checks=pa.Check.isin(validas),
+            nullable=True,
+            description=f"categórica en {validas}",
+        )
+
+    columnas[OBJETIVO] = pa.Column(
+        int,
+        checks=pa.Check.isin([0, 1]),
+        nullable=False,
+        description="variable objetivo binaria, sin faltantes",
+    )
+
+    return pa.DataFrameSchema(columns=columnas, strict=False, name="dataset_intermedio")
+
+
+def esquema_features() -> pa.DataFrameSchema:
+    """Esquema de la tabla de features: todo numérico, finito y en rango.
+
+    Los faltantes siguen permitidos (los imputa el pipeline de entrenamiento), pero
+    un infinito sí es un error: sólo puede venir de una división por cero mal
+    controlada en los atributos derivados.
+    """
+    sin_infinitos = pa.Check(es_finito, error="contiene valores infinitos")
+
+    columnas: dict[str, pa.Column] = {
+        nombre: pa.Column(float, checks=sin_infinitos, nullable=True)
+        for nombre in [*COLS_PASO_DIRECTO, *MAPA_BINARIAS, *ORDEN_ORDINALES]
+    }
+
+    for col in COLS_NOMINALES:
+        for categoria in CATEGORIAS_VALIDAS[col]:
+            nombre = f"{col}_{normalizar_nombre(categoria)}"
+            columnas[nombre] = pa.Column(
+                float,
+                checks=pa.Check.isin([0.0, 1.0]),
+                nullable=True,
+                description="indicador one-hot",
+            )
+
+    for nombre in NOMBRES_DERIVADOS:
+        columnas[nombre] = pa.Column(float, checks=sin_infinitos, nullable=True)
+
+    columnas[OBJETIVO] = pa.Column(int, checks=pa.Check.isin([0, 1]), nullable=False)
+
+    return pa.DataFrameSchema(columns=columnas, strict=True, name="features")
+
+
+def validar_esquema(datos: pd.DataFrame, esquema: pa.DataFrameSchema, etapa: str) -> None:
+    """Aplica un esquema de Pandera y traduce el fallo a `ErrorDeValidacion`.
+
+    `lazy=True` recoge **todas** las infracciones en una sola pasada, en vez de
+    detenerse en la primera: el mensaje resultante muestra el cuadro completo de
+    problemas, que es lo útil cuando llega un archivo nuevo con varios defectos.
+    """
+    try:
+        esquema.validate(datos, lazy=True)
+    except (SchemaError, SchemaErrors) as error:
+        detalle = getattr(error, "failure_cases", None)
+        resumen = (
+            detalle.head(20).to_string(index=False)
+            if isinstance(detalle, pd.DataFrame)
+            else str(error)
+        )
+        msg = f"[{etapa}] el dataset no cumple el esquema '{esquema.name}':\n{resumen}"
+        raise ErrorDeValidacion(msg) from error
+
+    logger.info("[%s] esquema '%s': OK", etapa, esquema.name)
+
+
+def validar_proporcion_nulos(
+    datos: pd.DataFrame, etapa: str, umbral: float = MAX_PROPORCION_NULOS
+) -> None:
+    """Ninguna columna puede superar la proporción de nulos admitida."""
+    proporciones = datos.isna().mean()
+    excedidas = proporciones[proporciones > umbral]
+    if not excedidas.empty:
+        detalle = ", ".join(f"{col} ({pct:.1%})" for col, pct in excedidas.items())
+        msg = f"[{etapa}] columnas por encima del {umbral:.0%} de nulos: {detalle}"
+        raise ErrorDeValidacion(msg)
+
+    logger.info(
+        "[%s] proporción de nulos: OK (máximo %.1f%%, umbral %.0f%%)",
+        etapa,
+        proporciones.max() * 100,
+        umbral * 100,
+    )
+
+
+def validar_unicidad(datos: pd.DataFrame, etapa: str, clave: list[str] | None = None) -> None:
+    """No puede haber registros repetidos según la clave configurada.
+
+    Con `clave` vacía la unicidad se evalúa sobre la fila completa, que es el
+    criterio aplicable a este dataset por no tener identificador de paciente.
+    """
+    columnas = clave if clave else list(datos.columns)
+    repetidos = int(datos.duplicated(subset=columnas).sum())
+    if repetidos:
+        etiqueta = f"la clave {columnas}" if clave else "el registro completo"
+        msg = f"[{etapa}] hay {repetidos} filas duplicadas según {etiqueta}"
+        raise ErrorDeValidacion(msg)
+
+    logger.info("[%s] unicidad de registros: OK", etapa)
+
+
+def validar_formato_fechas(
+    datos: pd.DataFrame, etapa: str, columnas: dict[str, str] | None = None
+) -> None:
+    """Cada columna de fecha debe respetar exactamente su formato declarado."""
+    columnas = COLS_FECHA if columnas is None else columnas
+    if not columnas:
+        logger.info("[%s] formato de fechas: no aplica (el dataset no tiene fechas)", etapa)
+        return
+
+    for columna, formato in columnas.items():
+        if columna not in datos.columns:
+            msg = f"[{etapa}] falta la columna de fecha '{columna}'"
+            raise ErrorDeValidacion(msg)
+
+        serie = datos[columna]
+        convertidas = pd.to_datetime(serie, format=formato, errors="coerce")
+        invalidas = int((convertidas.isna() & serie.notna()).sum())
+        if invalidas:
+            msg = (
+                f"[{etapa}] la columna '{columna}' tiene {invalidas} valores que no "
+                f"respetan el formato {formato}"
+            )
+            raise ErrorDeValidacion(msg)
+
+    logger.info("[%s] formato de fechas: OK", etapa)
+
+
+def validar_integridad_derivados(features: pd.DataFrame, etapa: str) -> None:
+    """Los atributos derivados deben ser coherentes con las columnas que los originan.
+
+    Es una comprobación de integridad **entre campos**: recalcula las fórmulas a
+    partir de las columnas originales y exige que coincidan. Detecta un desalineado
+    de filas o un cambio en la fórmula que no se propagó.
+    """
+    esperada_fc = 220 - features["age"]
+    diferencia_fc = (features["fc_maxima_teorica"] - esperada_fc).abs()
+    if (diferencia_fc > TOLERANCIA).any():
+        msg = f"[{etapa}] 'fc_maxima_teorica' no coincide con 220 - age"
+        raise ErrorDeValidacion(msg)
+
+    esperada_reserva = features["max_hr"] - features["fc_maxima_teorica"]
+    diferencia_reserva = (features["reserva_cardiaca"] - esperada_reserva).abs()
+    if (diferencia_reserva > TOLERANCIA).any():
+        msg = f"[{etapa}] 'reserva_cardiaca' no coincide con max_hr - fc_maxima_teorica"
+        raise ErrorDeValidacion(msg)
+
+    logger.info("[%s] integridad de atributos derivados: OK", etapa)
+
+
+def validar_integridad_onehot(features: pd.DataFrame, etapa: str) -> None:
+    """Cada grupo one-hot debe sumar exactamente 1, o ser NaN por completo.
+
+    Integridad **entre campos**: una fila con dos categorías activas —o con ninguna
+    sin ser faltante— significa que la codificación se corrompió.
+    """
+    for col in COLS_NOMINALES:
+        columnas = [f"{col}_{normalizar_nombre(c)}" for c in CATEGORIAS_VALIDAS[col]]
+        bloque = features[columnas]
+        todo_nulo = bloque.isna().all(axis=1)
+        suma = bloque.sum(axis=1)
+
+        incoherentes = int((~todo_nulo & (suma != 1)).sum())
+        parcialmente_nulo = int((bloque.isna().any(axis=1) & ~todo_nulo).sum())
+
+        if incoherentes or parcialmente_nulo:
+            msg = (
+                f"[{etapa}] la codificación one-hot de '{col}' es inconsistente: "
+                f"{incoherentes} filas no suman 1 y {parcialmente_nulo} filas tienen "
+                f"faltantes parciales"
+            )
+            raise ErrorDeValidacion(msg)
+
+    logger.info("[%s] integridad de la codificación one-hot: OK", etapa)
+
+
+def validar_consistencia_datasets(intermedio: pd.DataFrame, features: pd.DataFrame) -> None:
+    """Integridad **entre datasets**: intermedio y features deben corresponderse.
+
+    La transformación no elimina ni añade filas, así que ambos deben tener el mismo
+    número de registros y la misma variable objetivo, fila a fila.
+    """
+    if len(intermedio) != len(features):
+        msg = (
+            f"[features] el número de filas no coincide: intermedio {len(intermedio)} "
+            f"vs. features {len(features)}"
+        )
+        raise ErrorDeValidacion(msg)
+
+    if (
+        not intermedio[OBJETIVO]
+        .reset_index(drop=True)
+        .equals(features[OBJETIVO].reset_index(drop=True))
+    ):
+        msg = "[features] la variable objetivo no coincide entre intermedio y features"
+        raise ErrorDeValidacion(msg)
+
+    logger.info("[features] consistencia entre datasets: OK")
+
+
+def validar_entrada(crudo: pd.DataFrame) -> None:
+    """Valida el archivo crudo antes de transformarlo."""
+    validar_esquema(crudo, esquema_crudo(), "entrada")
+
+
+def validar_intermedio(depurado: pd.DataFrame) -> None:
+    """Valida calidad, consistencia y formato del dataset saneado."""
+    validar_esquema(depurado, esquema_intermedio(), "intermedio")
+    validar_proporcion_nulos(depurado, "intermedio")
+    validar_formato_fechas(depurado, "intermedio")
+    validar_unicidad(depurado, "intermedio", CLAVE_UNICIDAD)
+
+
+def validar_features(features: pd.DataFrame, intermedio: pd.DataFrame) -> None:
+    """Valida la tabla de features y su integridad frente al dataset intermedio."""
+    validar_esquema(features, esquema_features(), "features")
+    validar_integridad_derivados(features, "features")
+    validar_integridad_onehot(features, "features")
+    validar_consistencia_datasets(intermedio, features)
+
+
+#: Reglas aplicadas, en orden. Se registra en el manifiesto para trazabilidad.
+REGLAS_APLICADAS: list[str] = [
+    "entrada: esquema de columnas y archivo no vacío",
+    "intermedio: tipos esperados por columna",
+    "intermedio: rangos de plausibilidad clínica",
+    "intermedio: categorías válidas del dominio",
+    "intermedio: variable objetivo binaria y sin faltantes",
+    f"intermedio: proporción de nulos <= {MAX_PROPORCION_NULOS:.0%} por columna",
+    "intermedio: formato de las columnas de fecha declaradas",
+    "intermedio: unicidad de registros",
+    "features: todo numérico, finito y one-hot en {0, 1}",
+    "features: integridad entre campos (atributos derivados)",
+    "features: integridad entre campos (codificación one-hot)",
+    "features: integridad entre datasets (intermedio vs. features)",
+]
+
+
+# --------------------------------------------------------------------------- #
+# 5. Escritura
 # --------------------------------------------------------------------------- #
 
 
@@ -297,6 +674,7 @@ def guardar_metadatos(features: pd.DataFrame, entrada: Path, ruta: Path) -> Path
             for col in features.columns
             if int(features[col].isna().sum()) > 0
         },
+        "validaciones_superadas": REGLAS_APLICADAS,
     }
     ruta.parent.mkdir(parents=True, exist_ok=True)
     ruta.write_text(json.dumps(metadatos, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -305,7 +683,7 @@ def guardar_metadatos(features: pd.DataFrame, entrada: Path, ruta: Path) -> Path
 
 
 # --------------------------------------------------------------------------- #
-# 5. Punto de entrada
+# 6. Punto de entrada
 # --------------------------------------------------------------------------- #
 
 
@@ -338,9 +716,20 @@ def parsear_argumentos(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def ejecutar_pipeline(
     entrada: Path, intermedio: Path, salida: Path, metadatos: Path
 ) -> pd.DataFrame:
-    """Ejecuta el pipeline completo y devuelve la tabla de features."""
+    """Ejecuta el pipeline completo y devuelve la tabla de features.
+
+    El orden importa: **todas** las validaciones se ejecutan antes de la primera
+    escritura, de modo que un fallo de calidad deja el directorio de salida
+    intacto en lugar de dejar a medias un dataset inválido.
+    """
     crudo = leer_datos_crudos(entrada)
+    validar_entrada(crudo)
+
     depurado, features = construir_features(crudo)
+    validar_intermedio(depurado)
+    validar_features(features, depurado)
+
+    logger.info("Todas las validaciones superadas; se procede a persistir")
     guardar_parquet(depurado, intermedio)
     guardar_parquet(features, salida)
     guardar_metadatos(features, entrada, metadatos)
@@ -359,6 +748,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger.info("=== Feature pipeline: inicio ===")
     try:
         features = ejecutar_pipeline(args.entrada, args.intermedio, args.salida, args.metadatos)
+    except ErrorDeValidacion as error:
+        # TRY400 se silencia a propósito: aquí no queremos la traza de
+        # `logger.exception`. El fallo es de datos, no de código, y una traza
+        # sólo enterraría el mensaje que necesita leer quien corrige el dataset.
+        logger.error(  # noqa: TRY400
+            "VALIDACIÓN FALLIDA - no se persistió ningún archivo\n%s", error
+        )
+        return 1
     except (FileNotFoundError, ValueError, OSError):
         logger.exception("El feature pipeline falló")
         return 1

@@ -12,6 +12,8 @@ import pytest
 from pipelines.feature_pipeline.feature_pipeline import (
     CATEGORIAS_VALIDAS,
     OBJETIVO,
+    REGLAS_APLICADAS,
+    ErrorDeValidacion,
     codificar_categoricas,
     construir_features,
     depurar_filas,
@@ -24,6 +26,15 @@ from pipelines.feature_pipeline.feature_pipeline import (
     main,
     normalizar_nombre,
     sanear_dataset,
+    validar_consistencia_datasets,
+    validar_entrada,
+    validar_features,
+    validar_formato_fechas,
+    validar_integridad_derivados,
+    validar_integridad_onehot,
+    validar_intermedio,
+    validar_proporcion_nulos,
+    validar_unicidad,
 )
 
 #: Valores esperados usados en las aserciones (evita "magic values" en el linter).
@@ -377,3 +388,265 @@ def test_main_devuelve_uno_si_falta_la_entrada(tmp_path: Path) -> None:
     )
     assert codigo == 1
     assert not (tmp_path / "features.parquet").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Validación: datos válidos
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def depurado(crudo: pd.DataFrame) -> pd.DataFrame:
+    """Dataset saneado y depurado, válido según todas las reglas."""
+    return depurar_filas(sanear_dataset(crudo))
+
+
+@pytest.fixture
+def tabla_features(crudo: pd.DataFrame) -> pd.DataFrame:
+    """Tabla de features válida según todas las reglas."""
+    return construir_features(crudo)[1]
+
+
+def test_validar_entrada_acepta_datos_validos(crudo: pd.DataFrame) -> None:
+    """Un archivo crudo con el esquema esperado pasa la validación de entrada."""
+    validar_entrada(crudo)
+
+
+def test_validar_intermedio_acepta_datos_validos(depurado: pd.DataFrame) -> None:
+    """El dataset saneado del fixture cumple tipos, rangos, categorías y unicidad."""
+    validar_intermedio(depurado)
+
+
+def test_validar_features_acepta_datos_validos(
+    tabla_features: pd.DataFrame, depurado: pd.DataFrame
+) -> None:
+    """La tabla de features generada por el pipeline cumple todas sus reglas."""
+    validar_features(tabla_features, depurado)
+
+
+# --------------------------------------------------------------------------- #
+# Validación: datos inválidos — entrada
+# --------------------------------------------------------------------------- #
+
+
+def test_validar_entrada_rechaza_archivo_vacio(crudo: pd.DataFrame) -> None:
+    """Un archivo con las columnas correctas pero sin filas se rechaza."""
+    with pytest.raises(ErrorDeValidacion, match="entrada"):
+        validar_entrada(crudo.head(0))
+
+
+# --------------------------------------------------------------------------- #
+# Validación: datos inválidos — dataset intermedio
+# --------------------------------------------------------------------------- #
+
+
+def test_validar_intermedio_rechaza_valor_fuera_de_rango(depurado: pd.DataFrame) -> None:
+    """Una edad de 300 años es un dato imposible aunque sea numéricamente válido."""
+    invalido = depurado.copy()
+    invalido.loc[0, "age"] = 300.0
+    with pytest.raises(ErrorDeValidacion, match="dataset_intermedio"):
+        validar_intermedio(invalido)
+
+
+def test_validar_intermedio_rechaza_categoria_desconocida(depurado: pd.DataFrame) -> None:
+    """Una categoría fuera del catálogo del dominio detiene el pipeline."""
+    invalido = depurado.copy()
+    invalido.loc[0, "thal"] = "categoria_inventada"
+    with pytest.raises(ErrorDeValidacion, match="dataset_intermedio"):
+        validar_intermedio(invalido)
+
+
+def test_validar_intermedio_rechaza_objetivo_no_binario(depurado: pd.DataFrame) -> None:
+    """La variable objetivo sólo admite 0 y 1."""
+    invalido = depurado.copy()
+    invalido.loc[0, OBJETIVO] = 7
+    with pytest.raises(ErrorDeValidacion, match="dataset_intermedio"):
+        validar_intermedio(invalido)
+
+
+def test_validar_proporcion_nulos_rechaza_columna_demasiado_vacia(
+    depurado: pd.DataFrame,
+) -> None:
+    """Una columna mayoritariamente vacía deja de ser informativa."""
+    invalido = depurado.copy()
+    invalido["chol"] = np.nan
+    with pytest.raises(ErrorDeValidacion, match="nulos"):
+        validar_proporcion_nulos(invalido, "prueba")
+
+
+def test_validar_proporcion_nulos_acepta_bajo_el_umbral(depurado: pd.DataFrame) -> None:
+    """Por debajo del umbral configurado la validación pasa sin quejarse."""
+    validar_proporcion_nulos(depurado, "prueba", umbral=1.0)
+
+
+def test_validar_unicidad_rechaza_registros_repetidos(depurado: pd.DataFrame) -> None:
+    """Tras la deduplicación no puede quedar ninguna fila repetida."""
+    invalido = pd.concat([depurado, depurado.head(1)], ignore_index=True)
+    with pytest.raises(ErrorDeValidacion, match="duplicadas"):
+        validar_unicidad(invalido, "prueba")
+
+
+def test_validar_unicidad_con_clave_explicita() -> None:
+    """Con una clave declarada, la unicidad se evalúa sólo sobre esas columnas."""
+    datos = pd.DataFrame({"id_paciente": [1, 1, 2], "valor": [10, 20, 30]})
+    validar_unicidad(datos, "prueba")  # filas completas distintas: pasa
+    with pytest.raises(ErrorDeValidacion, match="id_paciente"):
+        validar_unicidad(datos, "prueba", clave=["id_paciente"])
+
+
+# --------------------------------------------------------------------------- #
+# Validación: formato de fechas
+# --------------------------------------------------------------------------- #
+
+
+def test_validar_formato_fechas_acepta_formato_correcto() -> None:
+    """Fechas que respetan el formato declarado pasan la validación."""
+    datos = pd.DataFrame({"fecha_examen": ["2026-01-15", "2026-02-28", None]})
+    validar_formato_fechas(datos, "prueba", {"fecha_examen": "%Y-%m-%d"})
+
+
+def test_validar_formato_fechas_rechaza_formato_incorrecto() -> None:
+    """Una fecha en otro formato se detecta y detiene el pipeline."""
+    datos = pd.DataFrame({"fecha_examen": ["2026-01-15", "15/01/2026"]})
+    with pytest.raises(ErrorDeValidacion, match="formato"):
+        validar_formato_fechas(datos, "prueba", {"fecha_examen": "%Y-%m-%d"})
+
+
+def test_validar_formato_fechas_rechaza_columna_ausente() -> None:
+    """Si se declara una columna de fecha, tiene que existir."""
+    datos = pd.DataFrame({"otra": [1, 2]})
+    with pytest.raises(ErrorDeValidacion, match="falta la columna"):
+        validar_formato_fechas(datos, "prueba", {"fecha_examen": "%Y-%m-%d"})
+
+
+def test_validar_formato_fechas_no_aplica_sin_columnas_declaradas(
+    depurado: pd.DataFrame,
+) -> None:
+    """Sin columnas de fecha configuradas la regla se salta sin error."""
+    validar_formato_fechas(depurado, "prueba", {})
+
+
+# --------------------------------------------------------------------------- #
+# Validación: integridad de la tabla de features
+# --------------------------------------------------------------------------- #
+
+
+def test_validar_features_rechaza_infinitos(
+    tabla_features: pd.DataFrame, depurado: pd.DataFrame
+) -> None:
+    """Un infinito delata una división por cero mal controlada."""
+    invalido = tabla_features.copy()
+    invalido.loc[0, "ratio_chol_edad"] = np.inf
+    with pytest.raises(ErrorDeValidacion, match="features"):
+        validar_features(invalido, depurado)
+
+
+def test_validar_integridad_derivados_detecta_incoherencia(
+    tabla_features: pd.DataFrame,
+) -> None:
+    """Si un atributo derivado deja de coincidir con su fórmula, se detecta."""
+    invalido = tabla_features.copy()
+    invalido.loc[0, "fc_maxima_teorica"] = invalido.loc[0, "fc_maxima_teorica"] + 5
+    with pytest.raises(ErrorDeValidacion, match="fc_maxima_teorica"):
+        validar_integridad_derivados(invalido, "prueba")
+
+
+def test_validar_integridad_onehot_detecta_fila_sin_categoria(
+    tabla_features: pd.DataFrame,
+) -> None:
+    """Una fila one-hot que no suma 1 sin ser toda NaN es una codificación corrupta."""
+    invalido = tabla_features.copy()
+    columnas_thal = [f"thal_{c}" for c in CATEGORIAS_VALIDAS["thal"]]
+    invalido.loc[0, columnas_thal] = 0.0
+    with pytest.raises(ErrorDeValidacion, match="one-hot"):
+        validar_integridad_onehot(invalido, "prueba")
+
+
+def test_validar_integridad_onehot_detecta_dos_categorias_activas(
+    tabla_features: pd.DataFrame,
+) -> None:
+    """Dos categorías activas en la misma fila es imposible por construcción."""
+    invalido = tabla_features.copy()
+    invalido.loc[0, [f"thal_{c}" for c in CATEGORIAS_VALIDAS["thal"]]] = 1.0
+    with pytest.raises(ErrorDeValidacion, match="one-hot"):
+        validar_integridad_onehot(invalido, "prueba")
+
+
+def test_validar_consistencia_datasets_detecta_desalineado(
+    tabla_features: pd.DataFrame, depurado: pd.DataFrame
+) -> None:
+    """Perder una fila entre el intermedio y los features es un error de integridad."""
+    with pytest.raises(ErrorDeValidacion, match="no coincide"):
+        validar_consistencia_datasets(depurado, tabla_features.iloc[:-1])
+
+
+# --------------------------------------------------------------------------- #
+# Requisito clave: sin persistencia cuando falla una validación
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def crudo_invalido(crudo: pd.DataFrame) -> pd.DataFrame:
+    """Datos crudos que superan el saneamiento pero violan el rango de `age`.
+
+    300 es un número perfectamente convertible, así que sobrevive al saneamiento:
+    sólo la validación de rango puede detenerlo.
+    """
+    invalido = crudo.copy()
+    invalido.loc[0, "age"] = "300"
+    return invalido
+
+
+def test_ejecutar_pipeline_no_persiste_si_falla_la_validacion(
+    tmp_path: Path, crudo_invalido: pd.DataFrame
+) -> None:
+    """Ningún archivo debe quedar escrito cuando una validación falla."""
+    entrada = tmp_path / "corazon.csv"
+    crudo_invalido.to_csv(entrada, index=False)
+    intermedio = tmp_path / "inter.parquet"
+    salida = tmp_path / "features.parquet"
+    metadatos = tmp_path / "meta.json"
+
+    with pytest.raises(ErrorDeValidacion):
+        ejecutar_pipeline(entrada, intermedio, salida, metadatos)
+
+    assert not intermedio.exists()
+    assert not salida.exists()
+    assert not metadatos.exists()
+
+
+def test_main_devuelve_uno_con_datos_invalidos(
+    tmp_path: Path, crudo_invalido: pd.DataFrame
+) -> None:
+    """El script termina con código 1 y sin escribir nada ante datos inválidos."""
+    entrada = tmp_path / "corazon.csv"
+    crudo_invalido.to_csv(entrada, index=False)
+    salida = tmp_path / "features.parquet"
+
+    codigo = main(
+        [
+            "--entrada",
+            str(entrada),
+            "--intermedio",
+            str(tmp_path / "inter.parquet"),
+            "--salida",
+            str(salida),
+            "--metadatos",
+            str(tmp_path / "meta.json"),
+        ]
+    )
+
+    assert codigo == 1
+    assert not salida.exists()
+
+
+def test_reglas_aplicadas_quedan_en_el_manifiesto(tmp_path: Path, crudo: pd.DataFrame) -> None:
+    """El manifiesto documenta qué validaciones superó el dataset persistido."""
+    entrada = tmp_path / "corazon.csv"
+    crudo.to_csv(entrada, index=False)
+    metadatos = tmp_path / "meta.json"
+
+    ejecutar_pipeline(entrada, tmp_path / "i.parquet", tmp_path / "f.parquet", metadatos)
+
+    manifiesto = json.loads(metadatos.read_text(encoding="utf-8"))
+    assert manifiesto["validaciones_superadas"] == REGLAS_APLICADAS
