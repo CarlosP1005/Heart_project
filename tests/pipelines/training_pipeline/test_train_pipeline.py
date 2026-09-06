@@ -18,7 +18,10 @@ from pipelines.training_pipeline.train_pipeline import (
     MODELOS,
     PROPORCION_TEST,
     UMBRAL_DEFECTO,
+    ErrorDeSeparacion,
+    ResultadoSeparacion,
     RutasSalida,
+    aplicar_resultado_separacion,
     construir_pipeline,
     construir_tabla_metricas,
     ejecutar_pipeline,
@@ -26,6 +29,7 @@ from pipelines.training_pipeline.train_pipeline import (
     evaluar,
     evaluar_modelo_trivial,
     guardar_artefacto,
+    guardar_checks_separacion,
     guardar_metricas,
     guardar_modelo,
     guardar_predicciones,
@@ -35,6 +39,8 @@ from pipelines.training_pipeline.train_pipeline import (
     optimizar_umbral,
     separar_train_test,
     validar_cruzado,
+    validar_separacion_train_test,
+    validate_train_test_split,
 )
 
 #: (X_train, X_test, y_train, y_test). El hook de mypy corre en un entorno aislado
@@ -47,6 +53,7 @@ N_FILAS_SINTETICAS = 200
 MIN_F1_ACEPTABLE = 0.6
 TOLERANCIA_PROPORCION = 0.02
 N_METRICAS = 7
+N_COMPROBACIONES = 9
 
 
 # --------------------------------------------------------------------------- #
@@ -405,6 +412,7 @@ def rutas_salida(tmp_path: Path) -> RutasSalida:
         predicciones=tmp_path / "predicciones.csv",
         metricas=tmp_path / "metricas.csv",
         manifiesto=tmp_path / "manifiesto.json",
+        checks_split=tmp_path / "checks_separacion.csv",
     )
 
 
@@ -502,6 +510,287 @@ def test_main_devuelve_uno_con_features_invalidos(
             str(rutas_salida.metricas),
             "--manifiesto",
             str(rutas_salida.manifiesto),
+        ]
+    )
+    assert codigo == 1
+    assert not rutas_salida.modelo.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Verificación de la separación train/test
+# --------------------------------------------------------------------------- #
+
+
+def severidades(resultado: ResultadoSeparacion) -> dict[str, str]:
+    """Mapa comprobación -> severidad, para aserciones legibles."""
+    return {c.nombre: c.severidad for c in resultado.comprobaciones}
+
+
+# --- Caso válido -----------------------------------------------------------
+
+
+def test_separacion_valida_no_reporta_errores(conjuntos: Conjuntos) -> None:
+    """La partición que produce el propio pipeline supera todas las comprobaciones."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test, y_train, y_test)
+    assert resultado.valida
+    assert resultado.errores == []
+
+
+def test_separacion_valida_cubre_todas_las_comprobaciones(conjuntos: Conjuntos) -> None:
+    """Se evalúan las nueve comprobaciones, no un subconjunto."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test, y_train, y_test)
+    assert len(resultado.comprobaciones) == N_COMPROBACIONES
+    assert {
+        "tamaño mínimo",
+        "proporción de test",
+        "columnas",
+        "índices disjuntos",
+        "filas duplicadas entre conjuntos",
+        "cobertura de clases",
+        "estratificación",
+        "distribución de atributos (KS)",
+        "faltantes comparables",
+    } == set(severidades(resultado))
+
+
+def test_alias_en_ingles_apunta_a_la_misma_funcion() -> None:
+    """El nombre del enunciado, `validate_train_test_split`, está disponible."""
+    assert validate_train_test_split is validar_separacion_train_test
+
+
+def test_resultado_expone_tabla_y_resumen(conjuntos: Conjuntos) -> None:
+    """El resultado se puede inspeccionar como tabla y resumir en una línea."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test, y_train, y_test)
+    tabla = resultado.tabla()
+    assert list(tabla.columns) == ["comprobacion", "severidad", "detalle"]
+    assert len(tabla) == len(resultado.comprobaciones)
+    assert "comprobaciones" in resultado.resumen()
+
+
+# --- Casos inválidos: errores (fuga de información) ------------------------
+
+
+def test_detecta_indices_compartidos(conjuntos: Conjuntos) -> None:
+    """Una fila presente en ambos conjuntos es fuga directa: error."""
+    x_train, x_test, y_train, y_test = conjuntos
+    x_test_sucio = pd.concat([x_test, x_train.head(3)])
+    y_test_sucio = pd.concat([y_test, y_train.head(3)])
+
+    resultado = validar_separacion_train_test(x_train, x_test_sucio, y_train, y_test_sucio)
+    assert not resultado.valida
+    assert severidades(resultado)["índices disjuntos"] == "error"
+
+
+def test_detecta_filas_duplicadas_con_indices_distintos(conjuntos: Conjuntos) -> None:
+    """El mismo paciente con otro índice sigue siendo fuga: comparar índices no basta."""
+    x_train, x_test, y_train, y_test = conjuntos
+    copia = x_train.head(3).copy()
+    copia.index = [999_001, 999_002, 999_003]
+    etiquetas = y_train.head(3).copy()
+    etiquetas.index = copia.index
+
+    resultado = validar_separacion_train_test(
+        x_train, pd.concat([x_test, copia]), y_train, pd.concat([y_test, etiquetas])
+    )
+    assert not resultado.valida
+    assert severidades(resultado)["filas duplicadas entre conjuntos"] == "error"
+    # Los índices sí son disjuntos: el error lo detecta la huella de la fila.
+    assert severidades(resultado)["índices disjuntos"] == "ok"
+
+
+def test_detecta_clase_ausente_en_test(conjuntos: Conjuntos) -> None:
+    """Sin ambas clases en el test, las métricas no significan nada."""
+    x_train, x_test, y_train, y_test = conjuntos
+    solo_sanos = y_test[y_test == 0]
+    resultado = validar_separacion_train_test(
+        x_train, x_test.loc[solo_sanos.index], y_train, solo_sanos
+    )
+    assert not resultado.valida
+    assert severidades(resultado)["cobertura de clases"] == "error"
+
+
+def test_detecta_conjunto_demasiado_pequeno(conjuntos: Conjuntos) -> None:
+    """Un test de 5 filas no permite estimar nada."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test.head(5), y_train, y_test.head(5))
+    assert not resultado.valida
+    assert severidades(resultado)["tamaño mínimo"] == "error"
+
+
+def test_detecta_columnas_distintas(conjuntos: Conjuntos) -> None:
+    """Train y test tienen que compartir exactamente el mismo esquema."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(
+        x_train, x_test.drop(columns=["age"]), y_train, y_test
+    )
+    assert not resultado.valida
+    assert severidades(resultado)["columnas"] == "error"
+
+
+# --- Casos inválidos: advertencias (representatividad) --------------------
+
+
+def test_advierte_proporcion_desviada(conjuntos: Conjuntos) -> None:
+    """Un reparto muy distinto del configurado se avisa, pero no bloquea."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test.head(25), y_train, y_test.head(25))
+    assert severidades(resultado)["proporción de test"] == "advertencia"
+    assert resultado.valida  # una advertencia no invalida la separación
+
+
+def test_advierte_estratificacion_rota(conjuntos: Conjuntos) -> None:
+    """Un test con prevalencia muy distinta a la de train se avisa."""
+    x_train, x_test, y_train, y_test = conjuntos
+    sesgado = pd.concat([y_test[y_test == 1], y_test[y_test == 0].head(3)])
+    resultado = validar_separacion_train_test(x_train, x_test.loc[sesgado.index], y_train, sesgado)
+    assert severidades(resultado)["estratificación"] == "advertencia"
+
+
+def test_advierte_distribucion_distinta(conjuntos: Conjuntos) -> None:
+    """Si un atributo se distribuye distinto, el test dejó de representar el problema."""
+    x_train, x_test, y_train, y_test = conjuntos
+    desplazado = x_test.copy()
+    desplazado["age"] = desplazado["age"] + 40  # un test de sólo mayores
+
+    resultado = validar_separacion_train_test(x_train, desplazado, y_train, y_test)
+    assert severidades(resultado)["distribución de atributos (KS)"] == "advertencia"
+    assert (
+        "age"
+        in dict((c.nombre, c.detalle) for c in resultado.comprobaciones)[
+            "distribución de atributos (KS)"
+        ]
+    )
+
+
+def test_advierte_faltantes_desbalanceados(conjuntos: Conjuntos) -> None:
+    """Un test con muchos más nulos que el train se avisa."""
+    x_train, x_test, y_train, y_test = conjuntos
+    con_huecos = x_test.copy()
+    con_huecos.loc[con_huecos.index[: len(con_huecos) // 2], "chol"] = np.nan
+
+    resultado = validar_separacion_train_test(x_train, con_huecos, y_train, y_test)
+    assert severidades(resultado)["faltantes comparables"] == "advertencia"
+
+
+# --- Política: qué detiene el pipeline y qué no ---------------------------
+
+
+def test_aplicar_no_lanza_si_todo_esta_bien(conjuntos: Conjuntos) -> None:
+    """Una separación correcta deja continuar sin ruido."""
+    x_train, x_test, y_train, y_test = conjuntos
+    aplicar_resultado_separacion(validar_separacion_train_test(x_train, x_test, y_train, y_test))
+
+
+def test_aplicar_lanza_error_controlado_ante_fuga(conjuntos: Conjuntos) -> None:
+    """Un error detiene el pipeline con un mensaje que nombra la comprobación."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(
+        x_train, pd.concat([x_test, x_train.head(3)]), y_train, pd.concat([y_test, y_train.head(3)])
+    )
+    with pytest.raises(ErrorDeSeparacion, match="índices disjuntos"):
+        aplicar_resultado_separacion(resultado)
+
+
+def test_aplicar_tolera_advertencias_por_defecto(conjuntos: Conjuntos) -> None:
+    """Una advertencia se registra pero no detiene la ejecución."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test.head(25), y_train, y_test.head(25))
+    assert resultado.advertencias
+    aplicar_resultado_separacion(resultado, estricto=False)
+
+
+def test_modo_estricto_convierte_advertencias_en_errores(conjuntos: Conjuntos) -> None:
+    """Con `--estricto` cualquier advertencia detiene el pipeline."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test.head(25), y_train, y_test.head(25))
+    with pytest.raises(ErrorDeSeparacion, match="estricto"):
+        aplicar_resultado_separacion(resultado, estricto=True)
+
+
+def test_error_de_separacion_hereda_de_error_de_validacion() -> None:
+    """Así el manejador de `main` la trata igual: sin traza y sin persistir nada."""
+    assert issubclass(ErrorDeSeparacion, ErrorDeValidacion)
+
+
+# --- Persistencia de los resultados ---------------------------------------
+
+
+def test_guardar_checks_escribe_csv(tmp_path: Path, conjuntos: Conjuntos) -> None:
+    """Los resultados de la separación quedan en un CSV auditable."""
+    x_train, x_test, y_train, y_test = conjuntos
+    resultado = validar_separacion_train_test(x_train, x_test, y_train, y_test)
+    ruta = tmp_path / "reportes" / "checks_separacion.csv"
+    guardar_checks_separacion(resultado, ruta)
+
+    releido = pd.read_csv(ruta)
+    assert len(releido) == N_COMPROBACIONES
+    assert set(releido["severidad"]) <= {"ok", "advertencia", "error"}
+
+
+def test_pipeline_completo_guarda_los_checks(
+    ruta_features: Path, rutas_salida: RutasSalida
+) -> None:
+    """La ejecución normal deja también el CSV de comprobaciones y el resumen."""
+    resumen = ejecutar_pipeline(ruta_features, rutas_salida)
+    assert rutas_salida.checks_split.is_file()
+    assert "comprobaciones" in resumen["checks_separacion"]["resumen"]
+
+
+def test_pipeline_no_entrena_si_la_separacion_tiene_fuga(
+    monkeypatch: pytest.MonkeyPatch, ruta_features: Path, rutas_salida: RutasSalida
+) -> None:
+    """Ante una partición con fuga, el pipeline aborta sin guardar el modelo."""
+
+    def separacion_con_fuga(
+        atributos: pd.DataFrame, objetivo: pd.Series, *args: Any, **kwargs: Any
+    ) -> Conjuntos:
+        """Devuelve el mismo conjunto como train y como test."""
+        return atributos, atributos, objetivo, objetivo
+
+    monkeypatch.setattr(
+        "pipelines.training_pipeline.train_pipeline.separar_train_test", separacion_con_fuga
+    )
+
+    with pytest.raises(ErrorDeSeparacion):
+        ejecutar_pipeline(ruta_features, rutas_salida)
+
+    assert not rutas_salida.modelo.exists()
+    assert not rutas_salida.metricas.exists()
+
+
+def test_main_devuelve_uno_ante_fuga(
+    monkeypatch: pytest.MonkeyPatch, ruta_features: Path, rutas_salida: RutasSalida
+) -> None:
+    """El script termina con código 1 y sin modelo cuando detecta fuga."""
+
+    def separacion_con_fuga(
+        atributos: pd.DataFrame, objetivo: pd.Series, *args: Any, **kwargs: Any
+    ) -> Conjuntos:
+        return atributos, atributos, objetivo, objetivo
+
+    monkeypatch.setattr(
+        "pipelines.training_pipeline.train_pipeline.separar_train_test", separacion_con_fuga
+    )
+
+    codigo = main(
+        [
+            "--features",
+            str(ruta_features),
+            "--modelo-salida",
+            str(rutas_salida.modelo),
+            "--artefacto",
+            str(rutas_salida.artefacto),
+            "--predicciones",
+            str(rutas_salida.predicciones),
+            "--metricas",
+            str(rutas_salida.metricas),
+            "--manifiesto",
+            str(rutas_salida.manifiesto),
+            "--checks-split",
+            str(rutas_salida.checks_split),
         ]
     )
     assert codigo == 1

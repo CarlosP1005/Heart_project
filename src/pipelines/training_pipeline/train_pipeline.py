@@ -17,6 +17,7 @@ Entradas y salidas
     data/07_model_output/predicciones_test.csv -> predicciones sobre el test
     data/08_reporting/metricas_entrenamiento.csv  -> métricas por conjunto
     data/08_reporting/metricas_entrenamiento.json -> manifiesto de la ejecución
+    data/08_reporting/checks_separacion.csv    -> comprobaciones de la separación
 
 Criterio de diseño
 ------------------
@@ -30,6 +31,20 @@ entrenamiento (*data leakage*).
 El modelo por defecto es el que ganó la comparación del notebook `5-models`: un
 *gradient boosting* regularizado. Los otros dos candidatos siguen disponibles con
 `--modelo` para poder reproducir la comparación.
+
+Verificación de la separación
+-----------------------------
+Antes de entrenar, `validar_separacion_train_test` comprueba que la partición sea
+utilizable. Distingue dos niveles:
+
+- **Errores** (detienen el pipeline): índices compartidos, filas idénticas en ambos
+  conjuntos, una clase ausente, un conjunto demasiado pequeño o con otras columnas.
+  Cualquiera de ellos invalida la evaluación por fuga de información.
+- **Advertencias** (se registran y dejan continuar): el reparto se desvía de lo
+  configurado, la estratificación no cuadra, algún atributo se distribuye distinto
+  entre train y test (Kolmogorov-Smirnov) o el patrón de faltantes difiere.
+
+Con `--estricto` las advertencias también detienen la ejecución.
 
 La métrica principal es **F1**. En un problema clínico con clases equilibradas
 (≈48 % de positivos) la exactitud sola es engañosa: importa tanto no dejar pasar
@@ -55,6 +70,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
+from scipy.stats import ks_2samp
 from sklearn.base import BaseEstimator, clone
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
@@ -130,6 +146,30 @@ METRICA_PRINCIPAL = "f1"
 #: Umbral de decisión por defecto sobre la probabilidad de la clase positiva.
 UMBRAL_DEFECTO = 0.5
 
+# --------------------------------------------------------------------------- #
+# Configuración de los checks de la separación train/test
+# --------------------------------------------------------------------------- #
+
+#: Desviación máxima admitida entre la prevalencia de train y la de test.
+#: Con estratificación la diferencia debería ser casi nula; 3 puntos deja margen
+#: para el redondeo al repartir filas y nada más.
+TOLERANCIA_ESTRATIFICACION = 0.03
+
+#: Desviación máxima admitida entre la proporción de test real y la configurada.
+TOLERANCIA_PROPORCION = 0.02
+
+#: Nivel de significación del test de Kolmogorov-Smirnov por columna. Se usa 0.01
+#: y no 0.05 porque se comparan 26 columnas: con 0.05 cabría esperar más de una
+#: "diferencia significativa" por puro azar.
+ALFA_DISTRIBUCION = 0.01
+
+#: Diferencia máxima admitida en la proporción de nulos de una columna entre
+#: train y test. Un desbalance mayor apunta a que la partición no fue aleatoria.
+TOLERANCIA_NULOS = 0.10
+
+#: Filas mínimas que debe tener cada conjunto para que las métricas signifiquen algo.
+MIN_FILAS_CONJUNTO = 20
+
 #: Modelos disponibles. El primero es el ganador de la comparación del notebook
 #: `5-models`; los otros dos permiten reproducir esa comparación desde el script.
 MODELOS: dict[str, BaseEstimator] = {
@@ -163,6 +203,7 @@ RUTA_MODELO = Path("data") / "06_models" / "modelo_corazon.joblib"
 RUTA_ARTEFACTO = Path("data") / "06_models" / "modelo_corazon_completo.joblib"
 RUTA_PREDICCIONES = Path("data") / "07_model_output" / "predicciones_test.csv"
 RUTA_METRICAS = Path("data") / "08_reporting" / "metricas_entrenamiento.csv"
+RUTA_CHECKS_SPLIT = Path("data") / "08_reporting" / "checks_separacion.csv"
 RUTA_MANIFIESTO = Path("data") / "08_reporting" / "metricas_entrenamiento.json"
 
 
@@ -179,6 +220,7 @@ class RutasSalida:
     predicciones: Path
     metricas: Path
     manifiesto: Path
+    checks_split: Path
 
     @classmethod
     def por_defecto(cls, raiz: Path) -> RutasSalida:
@@ -189,6 +231,7 @@ class RutasSalida:
             predicciones=raiz / RUTA_PREDICCIONES,
             metricas=raiz / RUTA_METRICAS,
             manifiesto=raiz / RUTA_MANIFIESTO,
+            checks_split=raiz / RUTA_CHECKS_SPLIT,
         )
 
 
@@ -258,7 +301,339 @@ def separar_train_test(
 
 
 # --------------------------------------------------------------------------- #
-# 2. Construcción y entrenamiento del modelo
+# 2. Verificación de la separación train/test
+# --------------------------------------------------------------------------- #
+
+
+class ErrorDeSeparacion(ErrorDeValidacion):
+    """La separación train/test no es utilizable.
+
+    Hereda de `ErrorDeValidacion` para que el manejador de `main` la trate igual:
+    mensaje claro, sin traza, y ningún modelo persistido.
+    """
+
+
+@dataclass(frozen=True)
+class Comprobacion:
+    """Resultado de una única comprobación sobre la separación."""
+
+    nombre: str
+    #: "ok" | "advertencia" | "error". Un error impide entrenar; una advertencia
+    #: se registra y deja continuar, porque describe un riesgo, no un defecto.
+    severidad: str
+    detalle: str
+
+    @property
+    def es_error(self) -> bool:
+        return self.severidad == "error"
+
+    @property
+    def es_advertencia(self) -> bool:
+        return self.severidad == "advertencia"
+
+
+@dataclass(frozen=True)
+class ResultadoSeparacion:
+    """Conjunto de comprobaciones aplicadas a una separación train/test."""
+
+    comprobaciones: list[Comprobacion]
+
+    @property
+    def errores(self) -> list[Comprobacion]:
+        return [c for c in self.comprobaciones if c.es_error]
+
+    @property
+    def advertencias(self) -> list[Comprobacion]:
+        return [c for c in self.comprobaciones if c.es_advertencia]
+
+    @property
+    def valida(self) -> bool:
+        """La separación es utilizable: ninguna comprobación falló como error."""
+        return not self.errores
+
+    def tabla(self) -> pd.DataFrame:
+        """Los resultados como DataFrame, para inspeccionar o guardar en CSV."""
+        return pd.DataFrame(
+            [
+                {"comprobacion": c.nombre, "severidad": c.severidad, "detalle": c.detalle}
+                for c in self.comprobaciones
+            ]
+        )
+
+    def resumen(self) -> str:
+        """Una línea con el recuento por severidad."""
+        return (
+            f"{len(self.comprobaciones)} comprobaciones: "
+            f"{len(self.errores)} errores, {len(self.advertencias)} advertencias"
+        )
+
+
+def _huellas(atributos: pd.DataFrame) -> pd.Series:
+    """Huella textual de cada fila, para detectar filas repetidas entre conjuntos.
+
+    Comparar índices no basta: dos filas con índices distintos pueden ser el mismo
+    paciente duplicado en el origen. Si una de esas copias cae en train y la otra
+    en test, el modelo ya vio la respuesta y el test deja de medir generalización.
+    """
+    # Los faltantes se representan con un marcador explícito: dos filas con NaN en
+    # la misma columna deben considerarse iguales, y `NaN != NaN` lo impediría.
+    texto = atributos.astype("string").fillna("<NA>")
+    return texto.agg("|".join, axis=1)
+
+
+def _comprobar_tamanos(
+    x_train: pd.DataFrame, x_test: pd.DataFrame, proporcion_test: float
+) -> list[Comprobacion]:
+    """Los dos conjuntos existen, no están vacíos y reparten según lo configurado."""
+    comprobaciones = []
+    total = len(x_train) + len(x_test)
+
+    if len(x_train) < MIN_FILAS_CONJUNTO or len(x_test) < MIN_FILAS_CONJUNTO:
+        comprobaciones.append(
+            Comprobacion(
+                "tamaño mínimo",
+                "error",
+                f"train={len(x_train)}, test={len(x_test)}; se exigen "
+                f"{MIN_FILAS_CONJUNTO} filas en cada uno",
+            )
+        )
+    else:
+        comprobaciones.append(
+            Comprobacion(
+                "tamaño mínimo", "ok", f"train={len(x_train)} filas, test={len(x_test)} filas"
+            )
+        )
+
+    real = len(x_test) / total if total else 0.0
+    desviacion = abs(real - proporcion_test)
+    severidad = "ok" if desviacion <= TOLERANCIA_PROPORCION else "advertencia"
+    comprobaciones.append(
+        Comprobacion(
+            "proporción de test",
+            severidad,
+            f"real {real:.1%} vs. configurada {proporcion_test:.0%} (desviación {desviacion:.1%})",
+        )
+    )
+    return comprobaciones
+
+
+def _comprobar_solape(x_train: pd.DataFrame, x_test: pd.DataFrame) -> list[Comprobacion]:
+    """Ninguna fila puede estar en los dos conjuntos: es la fuga más directa."""
+    comprobaciones = []
+
+    indices_compartidos = set(x_train.index) & set(x_test.index)
+    comprobaciones.append(
+        Comprobacion(
+            "índices disjuntos",
+            "error" if indices_compartidos else "ok",
+            f"{len(indices_compartidos)} índices en ambos conjuntos"
+            if indices_compartidos
+            else "ningún índice compartido",
+        )
+    )
+
+    repetidas = len(set(_huellas(x_train)) & set(_huellas(x_test)))
+    comprobaciones.append(
+        Comprobacion(
+            "filas duplicadas entre conjuntos",
+            "error" if repetidas else "ok",
+            f"{repetidas} filas idénticas presentes en train y en test"
+            if repetidas
+            else "ninguna fila de test aparece en train",
+        )
+    )
+    return comprobaciones
+
+
+def _comprobar_columnas(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Comprobacion:
+    """Ambos conjuntos deben tener las mismas columnas, en el mismo orden."""
+    if list(x_train.columns) == list(x_test.columns):
+        return Comprobacion("columnas", "ok", f"{x_train.shape[1]} columnas idénticas")
+
+    faltan = set(x_train.columns) ^ set(x_test.columns)
+    detalle = f"difieren en {sorted(faltan)}" if faltan else "mismas columnas en distinto orden"
+    return Comprobacion("columnas", "error", detalle)
+
+
+def _comprobar_clases(y_train: pd.Series, y_test: pd.Series) -> list[Comprobacion]:
+    """Las dos clases deben aparecer en ambos conjuntos y en proporción similar."""
+    comprobaciones = []
+
+    ausentes_train = {0, 1} - set(y_train.unique())
+    ausentes_test = {0, 1} - set(y_test.unique())
+    if ausentes_train or ausentes_test:
+        comprobaciones.append(
+            Comprobacion(
+                "cobertura de clases",
+                "error",
+                f"faltan clases en train: {sorted(ausentes_train)}, "
+                f"en test: {sorted(ausentes_test)}",
+            )
+        )
+    else:
+        comprobaciones.append(
+            Comprobacion("cobertura de clases", "ok", "ambas clases presentes en train y test")
+        )
+
+    diferencia = abs(float(y_train.mean()) - float(y_test.mean()))
+    severidad = "ok" if diferencia <= TOLERANCIA_ESTRATIFICACION else "advertencia"
+    comprobaciones.append(
+        Comprobacion(
+            "estratificación",
+            severidad,
+            f"positivos train {y_train.mean():.1%} vs. test {y_test.mean():.1%} "
+            f"(diferencia {diferencia:.1%})",
+        )
+    )
+    return comprobaciones
+
+
+def _comprobar_distribuciones(
+    x_train: pd.DataFrame, x_test: pd.DataFrame, alfa: float = ALFA_DISTRIBUCION
+) -> Comprobacion:
+    """Cada atributo debe distribuirse igual en train y en test.
+
+    Se aplica el test de Kolmogorov-Smirnov de dos muestras columna a columna. Es
+    no paramétrico, así que sirve igual para las continuas que para los indicadores
+    one-hot, y no asume normalidad —que estos datos no tienen—.
+
+    Un p-valor bajo significa que las dos muestras vienen de distribuciones
+    distintas: la partición sesgó ese atributo y el test dejó de representar el
+    mismo problema. Es una advertencia y no un error porque con 26 columnas y una
+    muestra pequeña conviene mirarlo antes que abortar automáticamente.
+    """
+    sospechosas = []
+    # Sólo las columnas comunes: si los esquemas difieren, eso ya lo reporta
+    # `_comprobar_columnas` como error y aquí no debe reventar.
+    comunes = [c for c in x_train.columns if c in x_test.columns]
+    for columna in comunes:
+        muestra_train = x_train[columna].dropna().to_numpy(dtype="float64")
+        muestra_test = x_test[columna].dropna().to_numpy(dtype="float64")
+        if len(muestra_train) < 2 or len(muestra_test) < 2:  # noqa: PLR2004
+            continue
+        p_valor = float(ks_2samp(muestra_train, muestra_test).pvalue)
+        if p_valor < alfa:
+            sospechosas.append(f"{columna} (p={p_valor:.4f})")
+
+    if sospechosas:
+        return Comprobacion(
+            "distribución de atributos (KS)",
+            "advertencia",
+            f"{len(sospechosas)} de {len(comunes)} atributos difieren "
+            f"(alfa={alfa}): {', '.join(sospechosas[:5])}",
+        )
+    return Comprobacion(
+        "distribución de atributos (KS)",
+        "ok",
+        f"ningún atributo difiere de forma significativa (alfa={alfa})",
+    )
+
+
+def _comprobar_nulos(x_train: pd.DataFrame, x_test: pd.DataFrame) -> Comprobacion:
+    """La proporción de faltantes debe ser parecida en ambos conjuntos.
+
+    Un test con muchos más nulos que el train mediría al modelo en condiciones que
+    no son las del entrenamiento, y el imputador —ajustado sólo con train— tendría
+    que rellenar mucho más de lo previsto.
+    """
+    comunes = [c for c in x_train.columns if c in x_test.columns]
+    nulos_train = x_train[comunes].isna().mean()
+    nulos_test = x_test[comunes].isna().mean()
+    diferencias = (nulos_train - nulos_test).abs()
+    excedidas = diferencias[diferencias > TOLERANCIA_NULOS]
+
+    if not excedidas.empty:
+        detalle = ", ".join(f"{col} ({dif:.1%})" for col, dif in excedidas.items())
+        return Comprobacion(
+            "faltantes comparables",
+            "advertencia",
+            f"diferencia mayor que {TOLERANCIA_NULOS:.0%} en: {detalle}",
+        )
+    return Comprobacion(
+        "faltantes comparables",
+        "ok",
+        f"diferencia máxima {diferencias.max():.1%} (tolerancia {TOLERANCIA_NULOS:.0%})",
+    )
+
+
+def validar_separacion_train_test(
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+    proporcion_test: float = PROPORCION_TEST,
+) -> ResultadoSeparacion:
+    """Verifica que la separación train/test es utilizable y representativa.
+
+    Es una función independiente y sin efectos secundarios: recibe los cuatro
+    conjuntos y devuelve el resultado. No escribe archivos, no lanza excepciones y
+    no depende del resto del pipeline, así que puede probarse aislada y reutilizarse
+    con cualquier otra partición.
+
+    Comprueba dos cosas distintas:
+
+    1. **Ausencia de fuga** (errores): índices disjuntos y ninguna fila idéntica en
+       ambos conjuntos. Si el modelo ya vio una fila del test, el test no mide nada.
+    2. **Representatividad** (advertencias): la proporción del reparto, la
+       estratificación de la clase, la distribución de cada atributo y el patrón de
+       faltantes. Aquí no hay nada roto, pero el test puede haber dejado de
+       representar el problema.
+    """
+    comprobaciones: list[Comprobacion] = []
+    comprobaciones.extend(_comprobar_tamanos(x_train, x_test, proporcion_test))
+    comprobaciones.append(_comprobar_columnas(x_train, x_test))
+    comprobaciones.extend(_comprobar_solape(x_train, x_test))
+    comprobaciones.extend(_comprobar_clases(y_train, y_test))
+    comprobaciones.append(_comprobar_distribuciones(x_train, x_test))
+    comprobaciones.append(_comprobar_nulos(x_train, x_test))
+    return ResultadoSeparacion(comprobaciones)
+
+
+#: Alias en inglés: el requerimiento nombra la función `validate_train_test_split()`.
+#: El resto del código está en español, así que ese es el nombre principal y este
+#: es sólo un puente para quien busque el nombre del enunciado.
+validate_train_test_split = validar_separacion_train_test
+
+
+def aplicar_resultado_separacion(resultado: ResultadoSeparacion, estricto: bool = False) -> None:
+    """Registra las comprobaciones y decide si el pipeline puede continuar.
+
+    Separada a propósito de `validar_separacion_train_test`: una función calcula y
+    la otra decide. Así la primera se puede usar para inspeccionar una partición sin
+    que aborte nada, y la política —qué es fatal y qué es un aviso— queda en un solo
+    sitio y es configurable con `--estricto`.
+    """
+    for comprobacion in resultado.comprobaciones:
+        if comprobacion.es_error:
+            logger.error("[split] %s: %s", comprobacion.nombre, comprobacion.detalle)
+        elif comprobacion.es_advertencia:
+            logger.warning("[split] %s: %s", comprobacion.nombre, comprobacion.detalle)
+        else:
+            logger.info("[split] %s: %s", comprobacion.nombre, comprobacion.detalle)
+
+    problemas = list(resultado.errores)
+    if estricto:
+        problemas += resultado.advertencias
+
+    if problemas:
+        detalle = "\n".join(f"  - {c.nombre}: {c.detalle}" for c in problemas)
+        modo = " (modo estricto: las advertencias cuentan como errores)" if estricto else ""
+        msg = f"La separación train/test no superó las comprobaciones{modo}:\n{detalle}"
+        raise ErrorDeSeparacion(msg)
+
+    logger.info("[split] %s", resultado.resumen())
+
+
+def guardar_checks_separacion(resultado: ResultadoSeparacion, ruta: Path) -> Path:
+    """Escribe el resultado de las comprobaciones en CSV."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    resultado.tabla().to_csv(ruta, index=False)
+    logger.info("Comprobaciones de la separación guardadas: %s", ruta)
+    return ruta
+
+
+# --------------------------------------------------------------------------- #
+# 3. Construcción y entrenamiento del modelo
 # --------------------------------------------------------------------------- #
 
 
@@ -369,7 +744,7 @@ def optimizar_umbral(
 
 
 # --------------------------------------------------------------------------- #
-# 3. Evaluación
+# 4. Evaluación
 # --------------------------------------------------------------------------- #
 
 
@@ -454,7 +829,7 @@ def construir_tabla_metricas(
 
 
 # --------------------------------------------------------------------------- #
-# 4. Almacenamiento
+# 5. Almacenamiento
 # --------------------------------------------------------------------------- #
 
 
@@ -520,7 +895,7 @@ def guardar_manifiesto(manifiesto: dict[str, Any], ruta: Path) -> Path:
 
 
 # --------------------------------------------------------------------------- #
-# 5. Orquestación
+# 6. Orquestación
 # --------------------------------------------------------------------------- #
 
 
@@ -528,10 +903,19 @@ def ejecutar_pipeline(
     features: Path,
     rutas: RutasSalida,
     nombre_modelo: str = MODELO_POR_DEFECTO,
+    estricto: bool = False,
 ) -> dict[str, Any]:
-    """Ejecuta el entrenamiento completo y devuelve el resumen de la ejecución."""
+    """Ejecuta el entrenamiento completo y devuelve el resumen de la ejecución.
+
+    La separación se verifica antes de construir nada: si la partición tiene fuga
+    de información, entrenar sobre ella sólo produciría métricas infladas.
+    """
     atributos, objetivo = leer_features(features)
     x_train, x_test, y_train, y_test = separar_train_test(atributos, objetivo)
+
+    checks_split = validar_separacion_train_test(x_train, x_test, y_train, y_test)
+    guardar_checks_separacion(checks_split, rutas.checks_split)
+    aplicar_resultado_separacion(checks_split, estricto=estricto)
 
     pipeline = construir_pipeline(nombre_modelo)
     metricas_cv = validar_cruzado(pipeline, x_train, y_train)
@@ -575,6 +959,10 @@ def ejecutar_pipeline(
         },
         "matriz_confusion_test": matriz_confusion(pipeline, x_test, y_test),
         "brecha_train_test_f1": round(metricas_train["f1"] - metricas_test["f1"], 4),
+        "checks_separacion": {
+            "resumen": checks_split.resumen(),
+            "advertencias": [f"{c.nombre}: {c.detalle}" for c in checks_split.advertencias],
+        },
         "version_sklearn": sklearn.__version__,
     }
 
@@ -588,7 +976,7 @@ def ejecutar_pipeline(
 
 
 # --------------------------------------------------------------------------- #
-# 6. Punto de entrada
+# 7. Punto de entrada
 # --------------------------------------------------------------------------- #
 
 
@@ -606,11 +994,17 @@ def parsear_argumentos(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--predicciones", type=Path, default=defecto.predicciones)
     parser.add_argument("--metricas", type=Path, default=defecto.metricas)
     parser.add_argument("--manifiesto", type=Path, default=defecto.manifiesto)
+    parser.add_argument("--checks-split", type=Path, default=defecto.checks_split)
     parser.add_argument(
         "--modelo",
         default=MODELO_POR_DEFECTO,
         choices=sorted(MODELOS),
         help="estimador a entrenar",
+    )
+    parser.add_argument(
+        "--estricto",
+        action="store_true",
+        help="trata las advertencias de la separación como errores",
     )
     parser.add_argument(
         "--nivel-log",
@@ -638,10 +1032,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             predicciones=args.predicciones,
             metricas=args.metricas,
             manifiesto=args.manifiesto,
+            checks_split=args.checks_split,
         )
-        resumen = ejecutar_pipeline(args.features, rutas, nombre_modelo=args.modelo)
+        resumen = ejecutar_pipeline(
+            args.features, rutas, nombre_modelo=args.modelo, estricto=args.estricto
+        )
     except ErrorDeValidacion as error:
-        # El problema son los datos de entrada, no el código: sin traza.
+        # Cubre también `ErrorDeSeparacion`, que hereda de ella. El problema son
+        # los datos, no el código: mensaje claro y sin traza.
         logger.error(  # noqa: TRY400
             "VALIDACIÓN FALLIDA - no se entrenó ningún modelo\n%s", error
         )
