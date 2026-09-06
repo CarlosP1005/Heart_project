@@ -24,6 +24,7 @@
     "**/__pycache__": true
   },
   "python.languageServer": "Pylance",
+  "python.analysis.extraPaths": ["src"],
   "editor.formatOnPaste": true,
   "notebook.lineNumbers": "on",
   "editor.inlineSuggest.enabled": true,
