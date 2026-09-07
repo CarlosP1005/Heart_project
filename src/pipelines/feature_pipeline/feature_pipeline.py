@@ -214,12 +214,18 @@ def sanear_dataset(datos: pd.DataFrame) -> pd.DataFrame:
     saneado = datos.copy()
 
     for col in COLS_NUMERICAS:
+        if col not in saneado.columns:
+            continue
         # `astype(float)` fija el tipo pase lo que pase: sin él, un lote sin
         # faltantes daría int64 y otro con faltantes float64, y el esquema de
         # validación fallaría por una diferencia que no es un problema de datos.
         saneado[col] = pd.to_numeric(saneado[col], errors="coerce").astype("float64")
 
     for col, validas in CATEGORIAS_VALIDAS.items():
+        # En inferencia no llega la variable objetivo: se salta lo que no exista
+        # en lugar de fallar, para poder reutilizar el saneamiento tal cual.
+        if col not in saneado.columns:
+            continue
         serie = saneado[col].astype("string").str.strip().str.lower()
         serie = serie.str.replace(r"\s+", " ", regex=True)
         saneado[col] = serie.where(serie.isin(validas))  # lo no válido queda como faltante
