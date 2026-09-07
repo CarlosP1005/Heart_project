@@ -16,20 +16,28 @@ from pipelines.feature_pipeline.feature_pipeline import ErrorDeValidacion, const
 from pipelines.training_pipeline.train_pipeline import (
     MODELO_POR_DEFECTO,
     MODELOS,
+    N_PARTICIONES,
+    N_REPETICIONES,
     PROPORCION_TEST,
     UMBRAL_DEFECTO,
+    UMBRAL_SOBREAJUSTE,
     ErrorDeSeparacion,
     ResultadoSeparacion,
     RutasSalida,
     aplicar_resultado_separacion,
     construir_pipeline,
     construir_tabla_metricas,
+    curva_aprendizaje,
+    diagnosticar_ajuste,
     ejecutar_pipeline,
     entrenar,
     evaluar,
     evaluar_modelo_trivial,
+    graficar_validacion,
     guardar_artefacto,
     guardar_checks_separacion,
+    guardar_curva,
+    guardar_diagnostico,
     guardar_metricas,
     guardar_modelo,
     guardar_predicciones,
@@ -37,6 +45,7 @@ from pipelines.training_pipeline.train_pipeline import (
     main,
     matriz_confusion,
     optimizar_umbral,
+    puntuaciones_por_particion,
     separar_train_test,
     validar_cruzado,
     validar_separacion_train_test,
@@ -413,6 +422,9 @@ def rutas_salida(tmp_path: Path) -> RutasSalida:
         metricas=tmp_path / "metricas.csv",
         manifiesto=tmp_path / "manifiesto.json",
         checks_split=tmp_path / "checks_separacion.csv",
+        curva=tmp_path / "curva_aprendizaje.csv",
+        diagnostico=tmp_path / "diagnostico_ajuste.json",
+        figuras=tmp_path / "figuras",
     )
 
 
@@ -422,9 +434,10 @@ def test_ejecutar_pipeline_genera_todas_las_salidas(
     """La ejecución completa deja modelo, predicciones, métricas y manifiesto."""
     resumen = ejecutar_pipeline(ruta_features, rutas_salida)
 
-    assert all(
-        getattr(rutas_salida, campo).is_file() for campo in rutas_salida.__dataclass_fields__
-    )
+    # `figuras` es un directorio; el resto de destinos son archivos.
+    archivos = [c for c in rutas_salida.__dataclass_fields__ if c != "figuras"]
+    assert all(getattr(rutas_salida, campo).is_file() for campo in archivos)
+    assert rutas_salida.figuras.is_dir()
     assert resumen["modelo"] == MODELO_POR_DEFECTO
     assert resumen["n_train"] + resumen["n_test"] == resumen["n_filas"]
 
@@ -795,3 +808,277 @@ def test_main_devuelve_uno_ante_fuga(
     )
     assert codigo == 1
     assert not rutas_salida.modelo.exists()
+
+
+# --------------------------------------------------------------------------- #
+# Validación del modelo: validación cruzada robusta
+# --------------------------------------------------------------------------- #
+
+
+def test_validacion_cruzada_es_repetida(conjuntos: Conjuntos) -> None:
+    """5 particiones x 3 repeticiones dan 15 evaluaciones, no 5."""
+    x_train, _, y_train, _ = conjuntos
+    resultado = validar_cruzado(construir_pipeline(), x_train, y_train)
+    assert resultado["n_evaluaciones"] == N_PARTICIONES * N_REPETICIONES
+
+
+def test_validacion_cruzada_reporta_dispersion(conjuntos: Conjuntos) -> None:
+    """Se reporta media, desviación y el rango observado entre evaluaciones."""
+    x_train, _, y_train, _ = conjuntos
+    resultado = validar_cruzado(construir_pipeline(), x_train, y_train, 3, 2)
+    assert resultado["f1_min"] <= resultado["f1"] <= resultado["f1_max"]
+    assert resultado["f1_std"] >= 0.0
+    assert "f1_train_cv" in resultado
+
+
+def test_validacion_cruzada_es_reproducible(conjuntos: Conjuntos) -> None:
+    """La semilla fija hace que dos ejecuciones den exactamente lo mismo."""
+    x_train, _, y_train, _ = conjuntos
+    primera = validar_cruzado(construir_pipeline(), x_train, y_train, 3, 2)
+    segunda = validar_cruzado(construir_pipeline(), x_train, y_train, 3, 2)
+    assert primera == segunda
+
+
+def test_puntuaciones_por_particion_devuelve_una_por_evaluacion(conjuntos: Conjuntos) -> None:
+    """Se obtiene el F1 individual de cada pliegue, no sólo la media."""
+    x_train, _, y_train, _ = conjuntos
+    puntuaciones = puntuaciones_por_particion(construir_pipeline(), x_train, y_train, 3, 2)
+    assert len(puntuaciones) == 6  # noqa: PLR2004
+    assert ((puntuaciones >= 0) & (puntuaciones <= 1)).all()
+
+
+# --------------------------------------------------------------------------- #
+# Curva de aprendizaje
+# --------------------------------------------------------------------------- #
+
+
+def test_curva_aprendizaje_tiene_un_punto_por_tamano(conjuntos: Conjuntos) -> None:
+    """Un punto por cada fracción de entrenamiento configurada."""
+    x_train, _, y_train, _ = conjuntos
+    curva = curva_aprendizaje(construir_pipeline(), x_train, y_train, (0.5, 1.0), 3)
+    assert len(curva) == 2  # noqa: PLR2004
+    assert list(curva.columns) == [
+        "n_filas_train",
+        "f1_train",
+        "f1_train_std",
+        "f1_validacion",
+        "f1_validacion_std",
+        "brecha",
+    ]
+
+
+def test_curva_aprendizaje_crece_en_filas(conjuntos: Conjuntos) -> None:
+    """El eje x va de menos a más filas de entrenamiento."""
+    x_train, _, y_train, _ = conjuntos
+    curva = curva_aprendizaje(construir_pipeline(), x_train, y_train, (0.3, 0.6, 1.0), 3)
+    assert curva["n_filas_train"].is_monotonic_increasing
+
+
+def test_curva_aprendizaje_calcula_la_brecha(conjuntos: Conjuntos) -> None:
+    """La columna `brecha` es exactamente train menos validación."""
+    x_train, _, y_train, _ = conjuntos
+    curva = curva_aprendizaje(construir_pipeline(), x_train, y_train, (0.5, 1.0), 3)
+    esperada = curva["f1_train"] - curva["f1_validacion"]
+    np.testing.assert_allclose(curva["brecha"], esperada)
+
+
+# --------------------------------------------------------------------------- #
+# Diagnóstico de ajuste
+# --------------------------------------------------------------------------- #
+
+
+def metricas_ficticias(f1: float) -> dict[str, float]:
+    """Conjunto mínimo de métricas con el F1 indicado."""
+    return {"f1": f1, "sensibilidad": f1, "precision": f1, "roc_auc": f1}
+
+
+def test_diagnostica_sobreajuste() -> None:
+    """Acertar mucho más en train que en validación es sobreajuste."""
+    diagnostico = diagnosticar_ajuste(
+        metricas_ficticias(0.98),
+        {**metricas_ficticias(0.75), "f1_std": 0.03},
+        metricas_ficticias(0.76),
+    )
+    assert diagnostico.veredicto == "sobreajuste"
+    assert diagnostico.brecha > UMBRAL_SOBREAJUSTE
+    assert any("regularización" in accion for accion in diagnostico.acciones)
+
+
+def test_diagnostica_subajuste() -> None:
+    """Fallar igual en train y en validación, y por debajo del umbral, es subajuste."""
+    diagnostico = diagnosticar_ajuste(
+        metricas_ficticias(0.60),
+        {**metricas_ficticias(0.58), "f1_std": 0.02},
+        metricas_ficticias(0.59),
+    )
+    assert diagnostico.veredicto == "subajuste"
+    assert any("capacidad" in accion for accion in diagnostico.acciones)
+
+
+def test_diagnostica_ajuste_adecuado() -> None:
+    """Buen rendimiento y brecha pequeña: no hay nada que corregir."""
+    diagnostico = diagnosticar_ajuste(
+        metricas_ficticias(0.86),
+        {**metricas_ficticias(0.83), "f1_std": 0.02},
+        metricas_ficticias(0.84),
+    )
+    assert diagnostico.veredicto == "ajuste adecuado"
+    assert diagnostico.acciones
+
+
+def test_diagnostico_avisa_si_el_test_es_atipico() -> None:
+    """Un test alejado más de 2 desviaciones de la CV es suerte, no rendimiento."""
+    diagnostico = diagnosticar_ajuste(
+        metricas_ficticias(0.86),
+        {**metricas_ficticias(0.83), "f1_std": 0.01},
+        metricas_ficticias(0.95),
+    )
+    assert any("optimista" in evidencia for evidencia in diagnostico.evidencias)
+    assert any("validación cruzada" in accion for accion in diagnostico.acciones)
+
+
+def test_diagnostico_detecta_curva_sin_saturar() -> None:
+    """Si la validación sigue subiendo, conseguir más datos es la mejor acción."""
+    curva = pd.DataFrame(
+        {
+            "n_filas_train": [100, 200],
+            "f1_train": [0.90, 0.91],
+            "f1_validacion": [0.78, 0.83],
+        }
+    )
+    diagnostico = diagnosticar_ajuste(
+        metricas_ficticias(0.91),
+        {**metricas_ficticias(0.83), "f1_std": 0.03},
+        metricas_ficticias(0.84),
+        curva,
+    )
+    assert any("más datos" in accion for accion in diagnostico.acciones)
+
+
+def test_diagnostico_es_serializable() -> None:
+    """El veredicto se puede volcar al manifiesto sin perder nada."""
+    diagnostico = diagnosticar_ajuste(
+        metricas_ficticias(0.90),
+        {**metricas_ficticias(0.85), "f1_std": 0.02},
+        metricas_ficticias(0.86),
+    )
+    como_dict = diagnostico.como_dict()
+    assert json.loads(json.dumps(como_dict))["veredicto"] == diagnostico.veredicto
+    assert como_dict["acciones_sugeridas"]
+
+
+# --------------------------------------------------------------------------- #
+# Evidencia: figuras y archivos
+# --------------------------------------------------------------------------- #
+
+
+def test_graficar_genera_las_tres_figuras(tmp_path: Path, conjuntos: Conjuntos) -> None:
+    """Las tres imágenes de evidencia se crean y no están vacías."""
+    x_train, _, y_train, _ = conjuntos
+    curva = curva_aprendizaje(construir_pipeline(), x_train, y_train, (0.5, 1.0), 3)
+    puntuaciones = puntuaciones_por_particion(construir_pipeline(), x_train, y_train, 3, 2)
+
+    figuras = graficar_validacion(
+        curva,
+        puntuaciones,
+        {
+            "entrenamiento": metricas_ficticias(0.95),
+            "validacion_cruzada": metricas_ficticias(0.80),
+            "test": metricas_ficticias(0.84),
+        },
+        tmp_path / "figuras",
+    )
+
+    assert len(figuras) == 3  # noqa: PLR2004
+    assert all(f.is_file() and f.stat().st_size > 0 for f in figuras)
+    assert {f.name for f in figuras} == {
+        "curva_aprendizaje.png",
+        "dispersion_f1.png",
+        "comparacion_conjuntos.png",
+    }
+
+
+def test_guardar_curva_escribe_csv(tmp_path: Path, conjuntos: Conjuntos) -> None:
+    """La curva queda en CSV para poder rehacer la figura sin reentrenar."""
+    x_train, _, y_train, _ = conjuntos
+    curva = curva_aprendizaje(construir_pipeline(), x_train, y_train, (0.5, 1.0), 3)
+    ruta = tmp_path / "reportes" / "curva.csv"
+    guardar_curva(curva, ruta)
+
+    releida = pd.read_csv(ruta)
+    assert len(releida) == len(curva)
+
+
+def test_guardar_diagnostico_escribe_json(tmp_path: Path) -> None:
+    """El diagnóstico queda en JSON legible."""
+    diagnostico = diagnosticar_ajuste(
+        metricas_ficticias(0.98),
+        {**metricas_ficticias(0.75), "f1_std": 0.03},
+        metricas_ficticias(0.76),
+    )
+    ruta = tmp_path / "diagnostico.json"
+    guardar_diagnostico(diagnostico, ruta)
+
+    contenido = json.loads(ruta.read_text(encoding="utf-8"))
+    assert contenido["veredicto"] == "sobreajuste"
+    assert contenido["acciones_sugeridas"]
+
+
+# --------------------------------------------------------------------------- #
+# Integración y reproducibilidad
+# --------------------------------------------------------------------------- #
+
+
+def test_pipeline_completo_genera_la_evidencia_de_validacion(
+    ruta_features: Path, rutas_salida: RutasSalida
+) -> None:
+    """La ejecución deja curva, diagnóstico y las tres figuras."""
+    resumen = ejecutar_pipeline(ruta_features, rutas_salida)
+
+    assert rutas_salida.curva.is_file()
+    assert rutas_salida.diagnostico.is_file()
+    assert len(list(rutas_salida.figuras.glob("*.png"))) == 3  # noqa: PLR2004
+    assert resumen["diagnostico_ajuste"]["veredicto"] in {
+        "subajuste",
+        "sobreajuste",
+        "ajuste adecuado",
+    }
+
+
+def test_manifiesto_documenta_el_esquema_de_validacion(
+    ruta_features: Path, rutas_salida: RutasSalida
+) -> None:
+    """El manifiesto deja constancia de cómo se validó, no sólo del resultado."""
+    ejecutar_pipeline(ruta_features, rutas_salida)
+    manifiesto = json.loads(rutas_salida.manifiesto.read_text(encoding="utf-8"))
+
+    assert "RepeatedStratifiedKFold" in manifiesto["validacion"]["esquema"]
+    assert manifiesto["validacion"]["n_evaluaciones"] == N_PARTICIONES * N_REPETICIONES
+    assert manifiesto["diagnostico_ajuste"]["acciones_sugeridas"]
+    assert len(manifiesto["figuras"]) == 3  # noqa: PLR2004
+
+
+def test_validacion_completa_es_reproducible(tmp_path: Path, ruta_features: Path) -> None:
+    """Dos ejecuciones independientes producen exactamente las mismas métricas."""
+
+    def ejecutar(sufijo: str) -> dict[str, Any]:
+        rutas = RutasSalida(
+            modelo=tmp_path / f"modelo_{sufijo}.joblib",
+            artefacto=tmp_path / f"artefacto_{sufijo}.joblib",
+            predicciones=tmp_path / f"predicciones_{sufijo}.csv",
+            metricas=tmp_path / f"metricas_{sufijo}.csv",
+            manifiesto=tmp_path / f"manifiesto_{sufijo}.json",
+            checks_split=tmp_path / f"checks_{sufijo}.csv",
+            curva=tmp_path / f"curva_{sufijo}.csv",
+            diagnostico=tmp_path / f"diagnostico_{sufijo}.json",
+            figuras=tmp_path / f"figuras_{sufijo}",
+        )
+        resultado: dict[str, Any] = ejecutar_pipeline(ruta_features, rutas)
+        return resultado
+
+    primera = ejecutar("a")
+    segunda = ejecutar("b")
+
+    assert primera["metricas"] == segunda["metricas"]
+    assert primera["diagnostico_ajuste"] == segunda["diagnostico_ajuste"]
+    assert primera["umbral_optimo"] == segunda["umbral_optimo"]

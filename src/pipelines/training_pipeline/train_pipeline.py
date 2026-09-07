@@ -18,6 +18,9 @@ Entradas y salidas
     data/08_reporting/metricas_entrenamiento.csv  -> métricas por conjunto
     data/08_reporting/metricas_entrenamiento.json -> manifiesto de la ejecución
     data/08_reporting/checks_separacion.csv    -> comprobaciones de la separación
+    data/08_reporting/curva_aprendizaje.csv    -> curva de aprendizaje
+    data/08_reporting/diagnostico_ajuste.json  -> veredicto y acciones sugeridas
+    data/08_reporting/figuras/*.png            -> evidencia visual de la validación
 
 Criterio de diseño
 ------------------
@@ -46,6 +49,14 @@ utilizable. Distingue dos niveles:
 
 Con `--estricto` las advertencias también detienen la ejecución.
 
+Validación del modelo
+---------------------
+La estimación de rendimiento se hace con `RepeatedStratifiedKFold` (5 particiones x 3
+repeticiones = 15 evaluaciones) sobre el conjunto de entrenamiento. `diagnosticar_ajuste`
+compara train, validación cruzada y test, clasifica el resultado en subajuste,
+sobreajuste o ajuste adecuado, y propone acciones concretas de mejora. La curva de
+aprendizaje y las figuras de `data/08_reporting/figuras/` sirven de evidencia.
+
 La métrica principal es **F1**. En un problema clínico con clases equilibradas
 (≈48 % de positivos) la exactitud sola es engañosa: importa tanto no dejar pasar
 un enfermo (sensibilidad) como no alarmar a un sano (precisión). Se reportan
@@ -67,6 +78,7 @@ from pathlib import Path
 from typing import Any
 
 import joblib
+import matplotlib
 import numpy as np
 import pandas as pd
 import sklearn
@@ -87,13 +99,19 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import (
+    RepeatedStratifiedKFold,
     StratifiedKFold,
     cross_val_predict,
     cross_validate,
+    learning_curve,
     train_test_split,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+# Backend sin ventana: el script corre en terminal y en CI, sin display.
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # El script debe poder ejecutarse directamente (`python src/pipelines/...`), en cuyo
 # caso `src` no está en el path y el paquete `pipelines` no es importable. Se añade
@@ -122,6 +140,23 @@ PROPORCION_TEST = 0.20
 
 #: Particiones de la validación cruzada sobre el conjunto de entrenamiento.
 N_PARTICIONES = 5
+
+#: Repeticiones de la validación cruzada. Con 384 filas, una sola pasada de 5
+#: particiones da una estimación inestable: cambiar la semilla mueve el F1 varios
+#: puntos. Repetir la partición 3 veces da 15 evaluaciones y una desviación típica
+#: en la que se puede confiar.
+N_REPETICIONES = 3
+
+#: F1 por debajo del cual se considera que el modelo no aprendió lo suficiente.
+UMBRAL_SUBAJUSTE = 0.70
+
+#: Brecha F1(train) - F1(validación) por encima de la cual se declara sobreajuste.
+#: Un modelo que acierta mucho más en lo que ya vio que en datos nuevos está
+#: memorizando, no generalizando.
+UMBRAL_SOBREAJUSTE = 0.10
+
+#: Tamaños de entrenamiento usados en la curva de aprendizaje, como fracción.
+TAMANOS_CURVA = (0.2, 0.4, 0.6, 0.8, 1.0)
 
 #: Métricas reportadas. F1 es la principal; el resto da el contexto necesario
 #: para interpretarla (¿falla por sensibilidad o por precisión?).
@@ -204,6 +239,9 @@ RUTA_ARTEFACTO = Path("data") / "06_models" / "modelo_corazon_completo.joblib"
 RUTA_PREDICCIONES = Path("data") / "07_model_output" / "predicciones_test.csv"
 RUTA_METRICAS = Path("data") / "08_reporting" / "metricas_entrenamiento.csv"
 RUTA_CHECKS_SPLIT = Path("data") / "08_reporting" / "checks_separacion.csv"
+RUTA_CURVA = Path("data") / "08_reporting" / "curva_aprendizaje.csv"
+RUTA_DIAGNOSTICO = Path("data") / "08_reporting" / "diagnostico_ajuste.json"
+RUTA_FIGURAS = Path("data") / "08_reporting" / "figuras"
 RUTA_MANIFIESTO = Path("data") / "08_reporting" / "metricas_entrenamiento.json"
 
 
@@ -221,6 +259,9 @@ class RutasSalida:
     metricas: Path
     manifiesto: Path
     checks_split: Path
+    curva: Path
+    diagnostico: Path
+    figuras: Path
 
     @classmethod
     def por_defecto(cls, raiz: Path) -> RutasSalida:
@@ -232,6 +273,9 @@ class RutasSalida:
             metricas=raiz / RUTA_METRICAS,
             manifiesto=raiz / RUTA_MANIFIESTO,
             checks_split=raiz / RUTA_CHECKS_SPLIT,
+            curva=raiz / RUTA_CURVA,
+            diagnostico=raiz / RUTA_DIAGNOSTICO,
+            figuras=raiz / RUTA_FIGURAS,
         )
 
 
@@ -669,13 +713,28 @@ def validar_cruzado(
     x_train: pd.DataFrame,
     y_train: pd.Series,
     n_particiones: int = N_PARTICIONES,
+    n_repeticiones: int = N_REPETICIONES,
 ) -> dict[str, float]:
-    """Estima el rendimiento con validación cruzada estratificada sobre el train.
+    """Estima el rendimiento con validación cruzada estratificada y repetida.
 
-    Es la estimación honesta que se usa para decidir: el conjunto de test se
-    reserva para una única medición final y no participa en ninguna elección.
+    **Por qué `RepeatedStratifiedKFold` y no `KFold` ni `TimeSeriesSplit`:**
+
+    - *Estratificada* porque el objetivo es binario: sin estratificar, con 384 filas,
+      algún pliegue puede quedar con una prevalencia muy distinta y su métrica deja de
+      ser comparable con la de los demás.
+    - *Repetida* porque una sola pasada de 5 pliegues da una estimación inestable en un
+      dataset de este tamaño; con 3 repeticiones son 15 evaluaciones y la desviación
+      típica empieza a significar algo.
+    - *No `TimeSeriesSplit`* porque no hay componente temporal: cada fila es un paciente
+      independiente, no una observación de una serie. Usarlo aquí impondría un orden
+      inventado y desperdiciaría datos sin ninguna razón.
+
+    Es la estimación honesta que se usa para decidir: el conjunto de test se reserva
+    para una única medición final y no participa en ninguna elección.
     """
-    cv = StratifiedKFold(n_splits=n_particiones, shuffle=True, random_state=SEMILLA)
+    cv = RepeatedStratifiedKFold(
+        n_splits=n_particiones, n_repeats=n_repeticiones, random_state=SEMILLA
+    )
     puntuaciones = cross_validate(
         pipeline,
         x_train,
@@ -690,26 +749,330 @@ def validar_cruzado(
             "roc_auc",
             "average_precision",
         ],
+        return_train_score=True,
         n_jobs=None,
     )
 
+    f1_val = puntuaciones["test_f1"]
     resultado = {
-        "f1": float(puntuaciones["test_f1"].mean()),
-        "f1_std": float(puntuaciones["test_f1"].std()),
+        "f1": float(f1_val.mean()),
+        "f1_std": float(f1_val.std()),
+        "f1_min": float(f1_val.min()),
+        "f1_max": float(f1_val.max()),
+        "f1_train_cv": float(puntuaciones["train_f1"].mean()),
         "sensibilidad": float(puntuaciones["test_recall"].mean()),
         "precision": float(puntuaciones["test_precision"].mean()),
         "exactitud_balanceada": float(puntuaciones["test_balanced_accuracy"].mean()),
         "exactitud": float(puntuaciones["test_accuracy"].mean()),
         "roc_auc": float(puntuaciones["test_roc_auc"].mean()),
         "pr_auc": float(puntuaciones["test_average_precision"].mean()),
+        "n_evaluaciones": len(f1_val),
     }
     logger.info(
-        "Validación cruzada (%s particiones): F1 = %.4f ± %.4f",
+        "Validación cruzada (%s x %s = %s evaluaciones): F1 = %.4f ± %.4f [%.4f, %.4f]",
         n_particiones,
+        n_repeticiones,
+        resultado["n_evaluaciones"],
         resultado["f1"],
         resultado["f1_std"],
+        resultado["f1_min"],
+        resultado["f1_max"],
     )
     return resultado
+
+
+def puntuaciones_por_particion(
+    pipeline: Pipeline,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    n_particiones: int = N_PARTICIONES,
+    n_repeticiones: int = N_REPETICIONES,
+) -> np.ndarray:
+    """F1 de cada una de las evaluaciones de la validación cruzada.
+
+    La media sola esconde la dispersión: un F1 medio de 0.77 con pliegues entre 0.70 y
+    0.84 es un resultado muy distinto de uno con pliegues entre 0.76 y 0.78.
+    """
+    cv = RepeatedStratifiedKFold(
+        n_splits=n_particiones, n_repeats=n_repeticiones, random_state=SEMILLA
+    )
+    # `scoring` como lista y no como cadena: así la clave del resultado es
+    # "test_f1" y no el genérico "test_score".
+    resultado = cross_validate(pipeline, x_train, y_train, cv=cv, scoring=["f1"])
+    return np.asarray(resultado["test_f1"], dtype="float64")
+
+
+def curva_aprendizaje(
+    pipeline: Pipeline,
+    x_train: pd.DataFrame,
+    y_train: pd.Series,
+    tamanos: Sequence[float] = TAMANOS_CURVA,
+    n_particiones: int = N_PARTICIONES,
+) -> pd.DataFrame:
+    """Rendimiento en train y en validación según el número de filas de entrenamiento.
+
+    Es la herramienta que distingue los dos problemas que se confunden:
+
+    - Si **ambas curvas son bajas y se juntan**, el modelo no tiene capacidad
+      suficiente: subajuste. Más datos no ayudarán.
+    - Si la de train es alta y la de validación **queda muy por debajo**, el modelo
+      memoriza: sobreajuste. Aquí sí puede ayudar más regularización, menos atributos
+      o más datos.
+    - Si la de validación **sigue subiendo** al llegar al 100 % de las filas, el techo
+      no se alcanzó todavía y conseguir más datos es la acción con mejor retorno.
+    """
+    cv = StratifiedKFold(n_splits=n_particiones, shuffle=True, random_state=SEMILLA)
+    fracciones, puntos_train, puntos_val = learning_curve(
+        clone(pipeline),
+        x_train,
+        y_train,
+        train_sizes=np.asarray(tamanos, dtype="float64"),
+        cv=cv,
+        scoring="f1",
+        random_state=SEMILLA,
+        n_jobs=None,
+    )
+
+    curva = pd.DataFrame(
+        {
+            "n_filas_train": fracciones,
+            "f1_train": puntos_train.mean(axis=1),
+            "f1_train_std": puntos_train.std(axis=1),
+            "f1_validacion": puntos_val.mean(axis=1),
+            "f1_validacion_std": puntos_val.std(axis=1),
+        }
+    )
+    curva["brecha"] = curva["f1_train"] - curva["f1_validacion"]
+    logger.info("Curva de aprendizaje calculada en %s tamaños de train", len(curva))
+    return curva
+
+
+@dataclass(frozen=True)
+class Diagnostico:
+    """Veredicto sobre el ajuste del modelo, con su evidencia y qué hacer."""
+
+    veredicto: str
+    brecha: float
+    f1_train: float
+    f1_validacion: float
+    f1_test: float
+    evidencias: list[str]
+    acciones: list[str]
+
+    def como_dict(self) -> dict[str, Any]:
+        """Representación serializable para el manifiesto."""
+        return {
+            "veredicto": self.veredicto,
+            "brecha_train_validacion": round(self.brecha, 4),
+            "f1_train": round(self.f1_train, 4),
+            "f1_validacion": round(self.f1_validacion, 4),
+            "f1_test": round(self.f1_test, 4),
+            "evidencias": self.evidencias,
+            "acciones_sugeridas": self.acciones,
+        }
+
+
+def diagnosticar_ajuste(
+    metricas_train: dict[str, float],
+    metricas_cv: dict[str, float],
+    metricas_test: dict[str, float],
+    curva: pd.DataFrame | None = None,
+) -> Diagnostico:
+    """Clasifica el ajuste del modelo y propone acciones concretas de mejora.
+
+    El criterio es explícito y auditable, no una impresión:
+
+    - **Subajuste**: F1 de validación por debajo de `UMBRAL_SUBAJUSTE` con una brecha
+      pequeña. El modelo falla igual en lo que vio y en lo que no: le falta capacidad
+      o le faltan atributos informativos.
+    - **Sobreajuste**: brecha train - validación por encima de `UMBRAL_SOBREAJUSTE`.
+      Acierta mucho más en lo que ya vio.
+    - **Ajuste adecuado**: ni una cosa ni la otra.
+
+    Además se comprueba si el test cae fuera del intervalo de la validación cruzada.
+    Cuando ocurre, el número del test es más suerte de la partición que rendimiento
+    real, y conviene decirlo antes de que alguien lo cite como definitivo.
+    """
+    f1_train = float(metricas_train["f1"])
+    f1_val = float(metricas_cv["f1"])
+    f1_test = float(metricas_test["f1"])
+    desviacion = float(metricas_cv.get("f1_std", 0.0))
+    brecha = f1_train - f1_val
+
+    evidencias = [
+        f"F1 en entrenamiento: {f1_train:.4f}",
+        f"F1 en validación cruzada: {f1_val:.4f} ± {desviacion:.4f}",
+        f"F1 en test: {f1_test:.4f}",
+        f"Brecha train - validación: {brecha:.4f} (umbral {UMBRAL_SOBREAJUSTE})",
+    ]
+
+    if f1_val < UMBRAL_SUBAJUSTE and brecha <= UMBRAL_SOBREAJUSTE:
+        veredicto = "subajuste"
+        acciones = [
+            "Aumentar la capacidad del modelo (más hojas, más iteraciones, menos regularización)",
+            "Revisar la ingeniería de características: añadir interacciones o atributos derivados",
+            "Probar un modelo con mayor capacidad de representación antes de descartar los datos",
+        ]
+    elif brecha > UMBRAL_SOBREAJUSTE:
+        veredicto = "sobreajuste"
+        acciones = [
+            "Aumentar la regularización (l2_regularization, min_samples_leaf, menos hojas)",
+            "Reducir el número de atributos: 26 columnas para 384 filas es una razón alta",
+            "Recolectar más datos: es la única acción que sube el techo en lugar de bajar la varianza",
+            "Recortar iteraciones con early stopping más agresivo",
+        ]
+    else:
+        veredicto = "ajuste adecuado"
+        acciones = [
+            "Mantener la configuración actual y vigilar la brecha en cada reentrenamiento",
+            "Si se necesita más rendimiento, buscar mejores atributos antes que un modelo mayor",
+        ]
+
+    # El test fuera del intervalo de la CV: el número no es representativo.
+    if desviacion > 0 and abs(f1_test - f1_val) > 2 * desviacion:
+        direccion = "optimista" if f1_test > f1_val else "pesimista"
+        evidencias.append(
+            f"El F1 de test se aleja más de 2 desviaciones de la media de validación: "
+            f"es una partición {direccion}, no un rendimiento distinto"
+        )
+        acciones.append(
+            "Citar el F1 de validación cruzada como estimación principal, no el del test"
+        )
+
+    if curva is not None and len(curva) >= 2:  # noqa: PLR2004
+        ultimo, penultimo = curva.iloc[-1], curva.iloc[-2]
+        if ultimo["f1_validacion"] > penultimo["f1_validacion"]:
+            evidencias.append(
+                "La curva de validación sigue subiendo con el 100 % de las filas: "
+                "el modelo aún no ha llegado a su techo con estos datos"
+            )
+            acciones.append("Conseguir más datos: la curva indica que todavía hay margen")
+
+    logger.info("Diagnóstico de ajuste: %s (brecha %.4f)", veredicto, brecha)
+    for accion in acciones:
+        logger.info("  acción sugerida: %s", accion)
+
+    return Diagnostico(
+        veredicto=veredicto,
+        brecha=brecha,
+        f1_train=f1_train,
+        f1_validacion=f1_val,
+        f1_test=f1_test,
+        evidencias=evidencias,
+        acciones=acciones,
+    )
+
+
+#: Paleta compartida por las figuras, para que se lean como un conjunto.
+AZUL, NARANJA, GRIS = "#2a78d6", "#eb6834", "#52514e"
+
+
+def _figura_curva_aprendizaje(curva: pd.DataFrame, ruta: Path) -> Path:
+    """Dibuja el F1 de train y de validación según el número de filas."""
+    fig, ax = plt.subplots(figsize=(7.2, 4.0))
+    for columna, desviacion, color, etiqueta in (
+        ("f1_train", "f1_train_std", AZUL, "entrenamiento"),
+        ("f1_validacion", "f1_validacion_std", NARANJA, "validación"),
+    ):
+        ax.plot(curva["n_filas_train"], curva[columna], "o-", color=color, label=etiqueta)
+        ax.fill_between(
+            curva["n_filas_train"],
+            curva[columna] - curva[desviacion],
+            curva[columna] + curva[desviacion],
+            color=color,
+            alpha=0.15,
+        )
+
+    ax.set_xlabel("filas de entrenamiento")
+    ax.set_ylabel("F1")
+    ax.set_title("Curva de aprendizaje")
+    ax.legend(frameon=False)
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=150)
+    plt.close(fig)
+    return ruta
+
+
+def _figura_dispersion(puntuaciones: np.ndarray, ruta: Path) -> Path:
+    """Dibuja el histograma del F1 obtenido en cada evaluación de la CV.
+
+    La media sola esconde la dispersión, y con 384 filas la dispersión es la mitad
+    de la historia: dice cuánto de lo que se ve es señal y cuánto es la partición.
+    """
+    fig, ax = plt.subplots(figsize=(7.2, 3.4))
+    ax.hist(puntuaciones, bins=10, color=AZUL, alpha=0.75, edgecolor="white")
+    ax.axvline(
+        puntuaciones.mean(),
+        color=NARANJA,
+        linestyle="--",
+        label=f"media {puntuaciones.mean():.3f}",
+    )
+    ax.set_xlabel("F1 por evaluación de la validación cruzada")
+    ax.set_ylabel("frecuencia")
+    ax.set_title(f"Dispersión del F1 ({len(puntuaciones)} evaluaciones)")
+    ax.legend(frameon=False)
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=150)
+    plt.close(fig)
+    return ruta
+
+
+def _figura_comparacion(metricas: dict[str, dict[str, float]], ruta: Path) -> Path:
+    """Dibuja las métricas comunes en entrenamiento, validación cruzada y test."""
+    comunes = ["f1", "sensibilidad", "precision", "roc_auc"]
+    posiciones = np.arange(len(comunes))
+    ancho = 0.27
+    estilos = (
+        ("entrenamiento", GRIS, -ancho),
+        ("validacion_cruzada", AZUL, 0.0),
+        ("test", NARANJA, ancho),
+    )
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.0))
+    for clave, color, desplazamiento in estilos:
+        ax.bar(
+            posiciones + desplazamiento,
+            [metricas[clave][m] for m in comunes],
+            ancho,
+            label=clave.replace("_", " "),
+            color=color,
+        )
+
+    ax.set_xticks(posiciones)
+    ax.set_xticklabels(comunes)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("valor")
+    ax.set_title("Comparación entre conjuntos")
+    ax.legend(frameon=False, ncols=3)
+    ax.grid(alpha=0.2, axis="y")
+    fig.tight_layout()
+    fig.savefig(ruta, dpi=150)
+    plt.close(fig)
+    return ruta
+
+
+def graficar_validacion(
+    curva: pd.DataFrame,
+    puntuaciones: np.ndarray,
+    metricas: dict[str, dict[str, float]],
+    directorio: Path,
+) -> list[Path]:
+    """Genera las tres figuras que sirven de evidencia de la validación.
+
+    `metricas` agrupa las tres evaluaciones bajo las claves "entrenamiento",
+    "validacion_cruzada" y "test". Se guardan como PNG para poder adjuntarlas al
+    informe sin depender de que alguien reejecute el notebook.
+    """
+    directorio.mkdir(parents=True, exist_ok=True)
+    generadas = [
+        _figura_curva_aprendizaje(curva, directorio / "curva_aprendizaje.png"),
+        _figura_dispersion(puntuaciones, directorio / "dispersion_f1.png"),
+        _figura_comparacion(metricas, directorio / "comparacion_conjuntos.png"),
+    ]
+    logger.info("Figuras de validación generadas: %s", ", ".join(f.name for f in generadas))
+    return generadas
 
 
 def optimizar_umbral(
@@ -819,7 +1182,11 @@ def construir_tabla_metricas(
     tabla = pd.DataFrame(
         {
             "entrenamiento": metricas_train,
-            "validacion_cruzada": {k: v for k, v in metricas_cv.items() if k != "f1_std"},
+            "validacion_cruzada": {
+                k: v
+                for k, v in metricas_cv.items()
+                if k in metricas_test  # sólo las métricas comparables entre conjuntos
+            },
             "test": metricas_test,
             "test_umbral_optimo": metricas_test_umbral,
             "base_trivial": metricas_trivial,
@@ -886,6 +1253,24 @@ def guardar_predicciones(
     return ruta
 
 
+def guardar_curva(curva: pd.DataFrame, ruta: Path) -> Path:
+    """Escribe la curva de aprendizaje en CSV."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    curva.to_csv(ruta, index=False)
+    logger.info("Curva de aprendizaje guardada: %s", ruta)
+    return ruta
+
+
+def guardar_diagnostico(diagnostico: Diagnostico, ruta: Path) -> Path:
+    """Escribe el diagnóstico de ajuste en JSON."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    ruta.write_text(
+        json.dumps(diagnostico.como_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    logger.info("Diagnóstico guardado: %s", ruta)
+    return ruta
+
+
 def guardar_manifiesto(manifiesto: dict[str, Any], ruta: Path) -> Path:
     """Escribe el manifiesto JSON de la ejecución."""
     ruta.parent.mkdir(parents=True, exist_ok=True)
@@ -919,6 +1304,8 @@ def ejecutar_pipeline(
 
     pipeline = construir_pipeline(nombre_modelo)
     metricas_cv = validar_cruzado(pipeline, x_train, y_train)
+    puntuaciones = puntuaciones_por_particion(pipeline, x_train, y_train)
+    curva = curva_aprendizaje(pipeline, x_train, y_train)
     umbral = optimizar_umbral(pipeline, x_train, y_train)
 
     entrenar(pipeline, x_train, y_train)
@@ -927,6 +1314,18 @@ def ejecutar_pipeline(
     metricas_test = evaluar(pipeline, x_test, y_test)
     metricas_test_umbral = evaluar(pipeline, x_test, y_test, umbral=umbral)
     metricas_trivial = evaluar_modelo_trivial(x_train, y_train, x_test, y_test)
+
+    diagnostico = diagnosticar_ajuste(metricas_train, metricas_cv, metricas_test, curva)
+    figuras = graficar_validacion(
+        curva,
+        puntuaciones,
+        {
+            "entrenamiento": metricas_train,
+            "validacion_cruzada": metricas_cv,
+            "test": metricas_test,
+        },
+        rutas.figuras,
+    )
 
     tabla = construir_tabla_metricas(
         metricas_cv, metricas_train, metricas_test, metricas_test_umbral, metricas_trivial
@@ -959,6 +1358,15 @@ def ejecutar_pipeline(
         },
         "matriz_confusion_test": matriz_confusion(pipeline, x_test, y_test),
         "brecha_train_test_f1": round(metricas_train["f1"] - metricas_test["f1"], 4),
+        "validacion": {
+            "esquema": f"RepeatedStratifiedKFold({N_PARTICIONES} x {N_REPETICIONES})",
+            "n_evaluaciones": metricas_cv["n_evaluaciones"],
+            "f1_std": round(metricas_cv["f1_std"], 4),
+            "f1_min": round(metricas_cv["f1_min"], 4),
+            "f1_max": round(metricas_cv["f1_max"], 4),
+        },
+        "diagnostico_ajuste": diagnostico.como_dict(),
+        "figuras": [str(f) for f in figuras],
         "checks_separacion": {
             "resumen": checks_split.resumen(),
             "advertencias": [f"{c.nombre}: {c.detalle}" for c in checks_split.advertencias],
@@ -970,6 +1378,8 @@ def ejecutar_pipeline(
     guardar_artefacto({"pipeline": pipeline, **resumen}, rutas.artefacto)
     guardar_predicciones(pipeline, x_test, y_test, umbral, rutas.predicciones)
     guardar_metricas(tabla, rutas.metricas)
+    guardar_curva(curva, rutas.curva)
+    guardar_diagnostico(diagnostico, rutas.diagnostico)
     guardar_manifiesto(resumen, rutas.manifiesto)
 
     return resumen
@@ -995,6 +1405,9 @@ def parsear_argumentos(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--metricas", type=Path, default=defecto.metricas)
     parser.add_argument("--manifiesto", type=Path, default=defecto.manifiesto)
     parser.add_argument("--checks-split", type=Path, default=defecto.checks_split)
+    parser.add_argument("--curva", type=Path, default=defecto.curva)
+    parser.add_argument("--diagnostico", type=Path, default=defecto.diagnostico)
+    parser.add_argument("--figuras", type=Path, default=defecto.figuras)
     parser.add_argument(
         "--modelo",
         default=MODELO_POR_DEFECTO,
@@ -1033,6 +1446,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             metricas=args.metricas,
             manifiesto=args.manifiesto,
             checks_split=args.checks_split,
+            curva=args.curva,
+            diagnostico=args.diagnostico,
+            figuras=args.figuras,
         )
         resumen = ejecutar_pipeline(
             args.features, rutas, nombre_modelo=args.modelo, estricto=args.estricto
@@ -1049,7 +1465,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     logger.info(
-        "=== Training pipeline: fin (F1 test = %.4f) ===", resumen["metricas"]["test"]["f1"]
+        "=== Training pipeline: fin (F1 test = %.4f | diagnóstico: %s) ===",
+        resumen["metricas"]["test"]["f1"],
+        resumen["diagnostico_ajuste"]["veredicto"],
     )
     return 0
 
