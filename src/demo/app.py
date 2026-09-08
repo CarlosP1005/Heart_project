@@ -373,7 +373,9 @@ def barra_lateral(modelo: ModeloCargado) -> float:
 
         st.divider()
         st.header("Umbral de decisión")
-        umbral = st.slider(
+        # Anotación explícita: el hook de mypy corre sin streamlit instalado y ve
+        # el retorno del widget como `Any`, lo que dispararía `no-any-return`.
+        umbral: float = st.slider(
             "Probabilidad a partir de la cual se clasifica como caso probable",
             min_value=0.05,
             max_value=0.95,

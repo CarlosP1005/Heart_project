@@ -52,7 +52,7 @@ def modelo_dummy_en_disco(tmp_path_factory: pytest.TempPathFactory) -> Path:
     )
     pipeline.fit(features, [0, 1, 1])
 
-    ruta = tmp_path_factory.mktemp("modelos") / "modelo_completo.joblib"
+    ruta: Path = tmp_path_factory.mktemp("modelos") / "modelo_completo.joblib"
     joblib.dump({"pipeline": pipeline, "umbral_optimo": 0.31, "modelo": "dummy"}, ruta)
     return ruta
 
