@@ -1,0 +1,11 @@
+# Dependencias para desplegar la demo en Streamlit Community Cloud.
+# scikit-learn va con versión exacta a propósito: el modelo se serializó con
+# joblib y una versión distinta puede no deserializarlo o cambiar su comportamiento.
+streamlit>=1.40
+scikit-learn==1.9.0
+pandera>=0.20
+pandas>=2.2
+numpy>=1.26
+joblib>=1.4
+matplotlib>=3.8
+pyarrow>=15.0
