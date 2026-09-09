@@ -93,7 +93,14 @@ def test_lee_un_parquet(crudo_sintetico: pd.DataFrame) -> None:
 
 
 def test_lee_un_excel(crudo_sintetico: pd.DataFrame) -> None:
-    """Excel es el formato en el que llegan de verdad las tablas clínicas."""
+    """Excel es el formato en el que llegan de verdad las tablas clínicas.
+
+    Se salta si falta `openpyxl`: es un lector opcional —el CSV y el Parquet no lo
+    necesitan— y la suite no debería fallar en rojo por una dependencia ausente
+    cuando lo que hay que hacer es instalarla.
+    """
+    pytest.importorskip("openpyxl", reason="lector de .xlsx opcional; instálalo con `uv sync`")
+
     buffer = io.BytesIO()
     crudo_sintetico.to_excel(buffer, index=False)
     datos = lote.leer_archivo("pacientes.xlsx", buffer.getvalue())
@@ -110,6 +117,12 @@ def test_rechaza_un_formato_desconocido(crudo_sintetico: pd.DataFrame) -> None:
     """Un `.json` no se intenta adivinar: se dice qué formatos hay."""
     with pytest.raises(lote.ErrorDeLote, match="Formato no soportado"):
         lote.leer_archivo("pacientes.json", b"{}")
+
+
+def test_rechaza_un_archivo_corrupto() -> None:
+    """Un archivo con la extensión correcta y el contenido roto da mensaje, no traza."""
+    with pytest.raises(lote.ErrorDeLote, match="No se pudo leer"):
+        lote.leer_archivo("pacientes.xlsx", b"esto no es un xlsx")
 
 
 def test_rechaza_un_archivo_vacio() -> None:

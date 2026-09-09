@@ -94,18 +94,36 @@ def leer_archivo(nombre: str, contenido: bytes) -> pd.DataFrame:
     extension = Path(nombre).suffix.lower().lstrip(".")
     buffer = io.BytesIO(contenido)
 
-    if extension == "csv":
-        datos = pd.read_csv(buffer, dtype=str, keep_default_na=True)
-    elif extension == "xlsx":
-        datos = pd.read_excel(buffer, dtype=str)
-    elif extension == "parquet":
-        datos = pd.read_parquet(buffer).astype("string")
-    else:
+    if extension not in EXTENSIONES_ACEPTADAS:
         msg = (
             f"Formato no soportado: '.{extension}'. "
             f"Formatos aceptados: {', '.join('.' + e for e in EXTENSIONES_ACEPTADAS)}."
         )
         raise ErrorDeLote(msg)
+
+    try:
+        if extension == "csv":
+            datos = pd.read_csv(buffer, dtype=str, keep_default_na=True)
+        elif extension == "xlsx":
+            datos = pd.read_excel(buffer, dtype=str)
+        else:
+            datos = pd.read_parquet(buffer).astype("string")
+    except ImportError as error:
+        # pandas delega .xlsx en openpyxl y .parquet en pyarrow, y sólo se entera al
+        # abrir el archivo. Sin esto el usuario vería un ModuleNotFoundError crudo,
+        # que no dice qué hacer.
+        msg = (
+            f"Falta la librería con la que pandas lee los .{extension} ({error}). "
+            "Instala las dependencias del proyecto con `uv sync`, o guarda el archivo "
+            "como .csv."
+        )
+        raise ErrorDeLote(msg) from error
+    except (ValueError, OSError) as error:
+        # Archivo corrupto, truncado o con otra extensión de la que dice. Se traduce
+        # a `ErrorDeLote` para que la página lo muestre como un mensaje y no como una
+        # traza de Python.
+        msg = f"No se pudo leer '{nombre}' como .{extension}: {error}"
+        raise ErrorDeLote(msg) from error
 
     if datos.empty:
         msg = f"El archivo '{nombre}' no contiene ninguna fila de datos."
