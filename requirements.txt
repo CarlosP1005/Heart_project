@@ -8,4 +8,7 @@ pandas>=2.2
 numpy>=1.26
 joblib>=1.4
 matplotlib>=3.8
+# pyarrow lee los .parquet y openpyxl los .xlsx que se suben en el procesamiento
+# por lotes; sin ellos pandas falla al abrir esos formatos en el despliegue.
 pyarrow>=15.0
+openpyxl>=3.1
