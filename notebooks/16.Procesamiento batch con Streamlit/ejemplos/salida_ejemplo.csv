@@ -1,0 +1,41 @@
+﻿id_paciente,centro,age,sex,chest_pain,rest_bp,chol,fbs,rest_ecg,max_hr,exang,old_peak,slope,ca,thal,probabilidad_enfermedad,prediccion,diagnostico,nivel_riesgo
+P-001,Clínica Norte,47,Male,asymptomatic,112,204,0,normal,143,0,0.1,1,0.0,normal,0.1616,0,sano,muy bajo
+P-002,Clínica Sur,41,Male,asymptomatic,110,172,0,left ventricular hypertrophy ,158,0,0.0,1,0.0,reversable,0.5546,1,enfermo,medio
+P-003,Clínica Norte,59,Male,nonanginal,126,218,1,normal,134,0,2.2,2,1.0,fixed,0.8994,1,enfermo,muy alto
+P-004,Clínica Sur,60,Male,nonanginal,140,,0,left ventricular hypertrophy ,155,0,3.0,2,0.0,normal,0.7859,1,enfermo,alto
+P-005,Clínica Norte,41,Male,nontypical,135,203,0,normal,132,0,0.0,2,0.0,fixed,0.2116,0,sano,bajo
+P-006,Clínica Sur,60,Female,asymptomatic,158,305,0,left ventricular hypertrophy ,161,0,0.0,1,0.0,normal,0.54,1,enfermo,medio
+P-007,Clínica Norte,38,Male,typical,120,231,0,normal,182,1,3.8,2,0.0,reversable,0.8737,1,enfermo,muy alto
+P-008,Clínica Sur,67,Female,asymptomatic,106,223,0,normal,142,0,0.3,1,2.0,normal,0.2733,0,sano,bajo
+P-009,Clínica Norte,57,Male,asymptomatic,150,276,0,left ventricular hypertrophy ,112,1,0.6,2,1.0,fixed,0.9684,1,enfermo,muy alto
+P-010,Clínica Sur,56,Female,asymptomatic,134,409,0,left ventricular hypertrophy ,150,1,1.9,2,2.0,reversable,0.9652,1,enfermo,muy alto
+P-011,Clínica Norte,53,Female,asymptomatic,130,264,0,left ventricular hypertrophy ,143,0,0.4,2,0.0,normal,0.0873,0,sano,muy bajo
+P-012,Clínica Sur,60,Female,nonanginal,120,178,1,normal,96,0,,1,0.0,normal,0.0584,0,sano,muy bajo
+P-013,Clínica Norte,64,Male,typical,170,227,0,left ventricular hypertrophy ,155,0,0.6,2,0.0,reversable,0.3186,1,enfermo,bajo
+P-014,Clínica Sur,39,Male,asymptomatic,118,219,0,normal,140,0,1.2,2,0.0,reversable,0.9285,1,enfermo,muy alto
+P-015,Clínica Norte,56,Male,nontypical,120,240,0,normal,169,0,0.0,3,0.0,normal,0.0488,0,sano,muy bajo
+P-016,Clínica Sur,70,Male,nontypical,156,245,0,left ventricular hypertrophy ,143,0,0.0,1,0.0,normal,0.0751,0,sano,muy bajo
+P-017,Clínica Norte,37,Male,nonanginal,130,250,0,normal,187,0,3.5,3,0.0,normal,0.3508,1,enfermo,bajo
+P-018,Clínica Sur,45,Male,asymptomatic,104,208,0,left ventricular hypertrophy ,148,1,3.0,2,0.0,normal,0.4165,1,enfermo,medio
+P-019,Clínica Norte,44,Male,nontypical,120,sfdywe,0,normal,adfs,0,0.0,1,0.0,reversable,0.094,0,sano,muy bajo
+P-020,Clínica Sur,59,Male,typical,178,270,0,left ventricular hypertrophy ,145,0,4.2,3,0.0,reversable,0.5517,1,enfermo,medio
+P-021,Clínica Norte,62,Male,nonanginal,130,231,0,normal,146,0,1.8,2,3.0,reversable,0.8821,1,enfermo,muy alto
+P-022,Clínica Sur,62,Female,asymptomatic,160,164,0,left ventricular hypertrophy ,145,0,6.2,3,3.0,reversable,0.9774,1,enfermo,muy alto
+P-023,Clínica Norte,66,Female,nonanginal,146,278,0,left ventricular hypertrophy ,152,0,0.0,2,1.0,normal,0.1827,0,sano,muy bajo
+P-024,Clínica Sur,58,Male,asymptomatic,125,300,0,left ventricular hypertrophy ,171,0,0.0,1,2.0,reversable,0.952,1,enfermo,muy alto
+P-025,Clínica Norte,44,Male,asymptomatic,110,197,0,left ventricular hypertrophy ,177,0,0.0,1,1.0,normal,0.8721,1,enfermo,muy alto
+P-026,Clínica Sur,68,Male,asymptomatic,144,193,1,normal,141,0,3.4,2,2.0,reversable,0.9534,1,enfermo,muy alto
+P-027,Clínica Norte,60,Female,nonanginal,102,318,0,normal,160,0,0.0,1,1.0,normal,0.0891,0,sano,muy bajo
+P-028,Clínica Sur,71,Female,nonanginal,,265,1,left ventricular hypertrophy ,130,0,0.0,1,1.0,normal,0.0675,0,sano,muy bajo
+P-029,Clínica Norte,60,Male,asymptomatic,145,282,0,left ventricular hypertrophy ,142,1,2.8,2,2.0,reversable,0.9769,1,enfermo,muy alto
+P-030,Clínica Sur,54,Male,nontypical,108,309,0,normal,156,0,0.0,1,0.0,reversable,0.1033,0,sano,muy bajo
+P-031,Clínica Norte,51,Female,nonanginal,130,256,0,left ventricular hypertrophy ,149,0,0.5,1,0.0,normal,0.0275,0,sano,muy bajo
+P-032,Clínica Sur,52,Male,nonanginal,172,199,1,normal,162,0,0.5,1,0.0,reversable,0.0521,0,sano,muy bajo
+P-033,Clínica Norte,52,Male,nontypical,128,205,1,normal,184,0,0.0,1,0.0,normal,0.0293,0,sano,muy bajo
+P-034,Clínica Sur,54,Female,nonanginal,110,214,0,normal,158,0,1.6,2,0.0,normal,0.033,0,sano,muy bajo
+P-035,Clínica Norte,58,Male,asymptomatic,100,234,0,normal,156,0,0.1,1,1.0,reversable,0.9025,1,enfermo,muy alto
+P-036,Clínica Sur,64,Male,asymptomatic,120,246,0,left ventricular hypertrophy ,96,1,2.2,3,1.0,normal,0.9332,1,enfermo,muy alto
+P-037,Clínica Norte,67,Male,asymptomatic,120,229,0,left ventricular hypertrophy ,129,1,2.6,2,2.0,reversable,0.982,1,enfermo,muy alto
+P-038,Clínica Sur,64,Male,asymptomatic,145,212,0,left ventricular hypertrophy ,132,0,2.0,2,2.0,fixed,0.9477,1,enfermo,muy alto
+P-039,Clínica Norte,54,Male,asymptomatic,124,266,0,left ventricular hypertrophy ,109,1,2.2,2,1.0,reversable,0.9903,1,enfermo,muy alto
+P-040,Clínica Sur,71,Female,asymptomatic,112,149,0,normal,125,0,1.6,2,0.0,normal,0.1851,0,sano,muy bajo

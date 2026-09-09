@@ -1,20 +1,32 @@
 # Demo online — Predicción de enfermedad cardíaca
 
 Aplicación web en [Streamlit](https://streamlit.io/) que expone el modelo entrenado por
-el *training pipeline*. El usuario introduce los 13 datos clínicos de un paciente y
-obtiene la probabilidad estimada de enfermedad coronaria.
+el *training pipeline*. Tiene dos páginas:
+
+- **Paciente individual** (`app.py`): se introducen los 13 datos clínicos de un paciente
+  y se obtiene la probabilidad estimada de enfermedad coronaria.
+- **Procesamiento por lotes** (`pages/Procesamiento_por_lotes.py`): se sube un archivo
+  con varios pacientes y se obtienen todas las predicciones, visibles en pantalla y
+  descargables en CSV.
 
 ## Contenido
 
 | Archivo | Qué es |
 |---|---|
-| `app.py` | La aplicación |
+| `app.py` | Página de predicción individual y punto de entrada |
+| `pages/Procesamiento_por_lotes.py` | Página de lotes (sólo widgets) |
+| `lote.py` | Lógica del lote: lectura, validación, predicción, resumen |
 | `models/modelo_corazon_completo.joblib` (raíz) | Modelo + umbral calibrado + metadatos |
 | `requirements.txt` (raíz) | Dependencias para Streamlit Community Cloud |
 
 La app **no incluye código de transformación**: importa el `inference_pipeline`, que a
 su vez importa el `feature_pipeline`. Una sola ruta de transformación para el
-entrenamiento, la inferencia por archivo y la demo.
+entrenamiento, la inferencia por archivo, la demo individual y el lote.
+
+La lógica del lote vive en `lote.py`, separada de la página, porque la interfaz de
+Streamlit no se puede probar con pytest sin levantar un navegador. Así las pruebas
+cubren el comportamiento real —qué archivos se aceptan, qué pasa si falta una columna,
+que ninguna fila se pierde— y no sólo el dibujo.
 
 ## Ejecutar en local
 
@@ -25,7 +37,12 @@ uv pip install -r requirements.txt
 uv run streamlit run src/demo/app.py
 ```
 
-Se abre en <http://localhost:8501>.
+Se abre en <http://localhost:8501>, con las dos páginas en la barra lateral. Si sólo
+interesa el lote, también se puede arrancar esa página sola:
+
+```bash
+uv run streamlit run src/demo/pages/Procesamiento_por_lotes.py
+```
 
 Si el modelo no existe todavía, la app lo dice y te indica el comando; hay que ejecutar
 antes los dos pipelines:
@@ -88,6 +105,46 @@ puede introducir un valor clínicamente imposible.
 señales clínicas de riesgo presentes. Estas últimas no son la explicación del modelo
 —un *gradient boosting* no decide así— sino un contexto que el usuario puede contrastar
 con lo que ve en el paciente.
+
+## Uso del procesamiento por lotes
+
+**1. Prepara el archivo.** Una fila por paciente y, como mínimo, las 13 columnas
+obligatorias con estos nombres exactos:
+
+```
+age, sex, chest_pain, rest_bp, chol, fbs, rest_ecg, max_hr, exang, old_peak, slope, ca, thal
+```
+
+Formatos aceptados: `.csv`, `.xlsx` y `.parquet`, hasta 5 000 filas. Hay una plantilla
+descargable dentro de la propia página, y ejemplos completos de entrada y salida en
+`notebooks/16.Procesamiento batch con Streamlit/ejemplos/`.
+
+Conviene saber:
+
+- **Columnas de más:** se conservan en la salida pero no entran al modelo. Un
+  identificador (`id_paciente`, `id` o `paciente`) se usa para etiquetar cada
+  resultado; si no hay ninguno, las filas se numeran de 1 en adelante. Si el archivo
+  trae la etiqueta real (`disease`), no se usa para predecir, pero queda en la salida y
+  permite comparar lo predicho con lo observado.
+- **Valores ausentes:** se pueden dejar vacíos. Los imputa el propio `Pipeline` con la
+  mediana aprendida en el entrenamiento.
+- **Columnas obligatorias que falten:** el lote **no se procesa**. La página dice
+  cuáles faltan y no genera ninguna descarga. Un lote a medias es peor que ninguno,
+  porque el usuario se lleva un CSV que parece completo.
+
+**2. Súbelo** en *Archivo de pacientes*.
+
+**3. Lee el resultado.** El resumen da el número de casos probables, la proporción, la
+probabilidad media, el reparto por banda de riesgo y el histograma de probabilidades.
+La tabla se puede filtrar por banda; el filtro sólo afecta a lo que se ve.
+
+**4. Descarga el CSV.** Incluye siempre el lote completo: el archivo original tal cual
+llegó más `probabilidad_enfermedad`, `prediccion`, `diagnostico` y `nivel_riesgo`. Va
+en UTF-8 con BOM para que Excel en Windows abra bien las tildes.
+
+**El umbral se aplica sobre el lote ya predicho.** Moverlo reclasifica sin volver a
+subir el archivo: las probabilidades no cambian, sólo el corte. Es la forma rápida de
+ver cuántos casos entrarían en revisión con una política más o menos conservadora.
 
 ## Advertencia
 
