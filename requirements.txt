@@ -2,7 +2,7 @@
 # scikit-learn va con versión exacta a propósito: el modelo se serializó con
 # joblib y una versión distinta puede no deserializarlo o cambiar su comportamiento.
 streamlit>=1.40
-scikit-learn==1.9.0
+scikit-learn==1.9.1
 pandera>=0.20
 pandas>=2.2
 numpy>=1.26
